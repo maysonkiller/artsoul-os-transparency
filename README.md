@@ -1,7 +1,7 @@
-# ArtSoul OS — the parts worth checking
+# ArtSoul OS, the parts worth checking
 
-[ArtSoul OS](https://artsoul-os.com) — *Operating System*, for a Discord
-community: the layer a server runs on instead of six separate bots — is a
+[ArtSoul OS](https://artsoul-os.com): *Operating System*, for a Discord
+community: the layer a server runs on instead of six separate bots, is a
 Discord bot that charges money in cryptocurrency. From the outside that looks exactly like something you should be
 careful with, and it should.
 
@@ -17,7 +17,7 @@ them and disagree.
 |---|---|
 | [`src/crypto.service.ts`](src/crypto.service.ts) | The whole payment verifier. Every rule that decides whether a transfer counts. |
 | [`src/payment-diagnosis.test.ts`](src/payment-diagnosis.test.ts) | The four distinct ways a payment can be wrong, each pinned by a test. |
-| [`src/protection.tracker.ts`](src/protection.tracker.ts) | The spam window — the only place the bot has ever touched message text. |
+| [`src/protection.tracker.ts`](src/protection.tracker.ts) | The spam window: the only place the bot has ever touched message text. |
 | [`src/protection-tracker-privacy.test.ts`](src/protection-tracker-privacy.test.ts) | A test that feeds it a message full of secrets and asserts none of it is written down. |
 | [`schema/schema.prisma`](schema/schema.prisma) | The complete data model. Every table, every column. |
 
@@ -25,7 +25,7 @@ them and disagree.
 
 **"We never hold your money."** There is no balance, no custody, no contract.
 Read `crypto.service.ts`: it takes a transaction hash, asks a node what that
-transaction did, and compares. It has no ability to move funds — there is no
+transaction did, and compares. It has no ability to move funds, there is no
 signing key anywhere in it, because a verifier does not need one.
 
 **"Payment is checked against the chain, not against something we typed in."**
@@ -40,7 +40,7 @@ reused."** Each hash is recorded once and refused thereafter.
 **"Message content is never stored."** This is the claim that was wrong until
 recently, and the honest version is worth stating precisely. The duplicate-spam
 filter has to recognise the same message sent twice. It used to keep the text to
-do that. It now keeps a truncated one-way hash — enough for an equality test,
+do that. It now keeps a truncated one-way hash: enough for an equality test,
 useless for reading. The window is seconds long. `protection-tracker-privacy.test.ts`
 is the guard, and the commit that changed it is in the history of the private
 repository; the column rename from `contents` to `content_hashes` is visible in
@@ -54,7 +54,7 @@ happened; `MemberXp` holds a number and a timestamp.
 
 The rest of the product: the bot, the API, the dashboard, the anti-raid
 heuristics beyond the tracker above, and the deployment. That code stays closed,
-and the reason is specific rather than commercial — publishing the exact
+and the reason is specific rather than commercial, publishing the exact
 thresholds and evasion paths of an abuse filter helps the people it exists to
 stop. If that trade-off bothers you, it is a fair thing to argue about; write to
 us.

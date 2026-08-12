@@ -1,6 +1,6 @@
 # Reporting a security issue
 
-**security@artsoul-os.com** — a person reads it, and you get an answer.
+**security@artsoul-os.com**. A person reads it, and you get an answer.
 
 Please write before publishing. Not to keep anything quiet: an unpatched issue
 in a live product is a problem for the servers using it, and a few days is
@@ -14,7 +14,7 @@ usually enough to close one.
 - Credit in the fix, if you want it. Say so, and how you would like to be named.
 
 There is no bug bounty. This is a small product and paying for reports honestly
-is not something it can do yet — saying that plainly seems better than a
+is not something it can do yet: saying that plainly seems better than a
 programme that quietly never pays out.
 
 ## In scope
