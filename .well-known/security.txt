@@ -1,0 +1,8 @@
+# ArtSoul OS — https://artsoul-os.com
+# RFC 9116. Also served at https://artsoul-os.com/.well-known/security.txt
+
+Contact: mailto:security@artsoul-os.com
+Expires: 2027-08-12T00:00:00.000Z
+Preferred-Languages: en, ru
+Canonical: https://artsoul-os.com/.well-known/security.txt
+Policy: https://github.com/maysonkiller/artsoul-os-transparency/blob/main/SECURITY.md

@@ -1,0 +1,1582 @@
+// ============================================================
+// ARTSOUL OS — PRISMA SCHEMA
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ── ENUMS ────────────────────────────────────────────────────
+
+enum RoleName {
+  GUEST
+  BUILDER
+  EARLY
+  GENESIS
+  TEAM
+  TR
+  IN
+  EU
+  PL
+  CN
+  KR
+  VN
+  CIS
+  UA
+  HELPER_TR
+  HELPER_IN
+  HELPER_EU
+  HELPER_PL
+  HELPER_CN
+  HELPER_KR
+  HELPER_VN
+  HELPER_CIS
+  HELPER_UA
+}
+
+enum RoleAction {
+  GRANTED
+  REVOKED
+  PENDING_REVIEW
+}
+
+// Subscription tier for a guild (Plan Limits / SaaS gates). Ordered by ascending
+// privilege. The concrete per-plan limits live in code (packages/shared/plans.ts)
+// — this enum only records WHICH tier a guild is on. No payment provider: the
+// system owner sets the plan manually.
+enum SubscriptionPlan {
+  FREE
+  STARTER
+  PRO
+  PREMIUM
+}
+
+// Dashboard access level (RBAC). Ordered by ascending privilege. A user with a
+// null accessLevel has NO dashboard access. The Owner (discordId from config) is
+// always treated as OWNER regardless of this field. Critical/destructive actions
+// require OWNER exactly and are never delegated.
+enum AccessLevel {
+  VIEWER
+  MODERATOR
+  ADMIN
+  DEPUTY
+  OWNER
+}
+
+enum CaptchaStatus {
+  PENDING
+  PASSED
+  FAILED
+  EXPIRED
+}
+
+enum VerificationStatus {
+  PASSED
+  FAILED
+  PENDING_REVIEW
+  PENDING
+}
+
+enum ProtectionEventType {
+  SPAM
+  DUPLICATE
+  MASS_MENTION
+  CAPS
+  INVITE_LINK
+  SCAM_LINK
+  DRAINER_LINK
+  SUSPICIOUS_SHORTENER
+  SUSPICIOUS_ACCOUNT
+  RAID_SPIKE
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum WarningSeverity {
+  MINOR
+  SERIOUS
+}
+
+enum ProtectionAction {
+  WARNED
+  TIMEOUT_5
+  TIMEOUT_15
+  TIMEOUT_30
+  LOGGED
+}
+
+enum TimeoutSource {
+  AUTO
+  MANUAL
+}
+
+enum AuditActorType {
+  OWNER
+  TEAM
+  SYSTEM
+  BOT
+}
+
+enum AuditTargetType {
+  USER
+  ROLE
+  CHANNEL
+  SYSTEM
+}
+
+enum EmergencyStatus {
+  ACTIVE
+  RESOLVED
+}
+
+enum BackupType {
+  DATABASE
+  SETTINGS
+  ROLES_MAPPING
+  AUDIT_LOGS
+}
+
+enum BackupStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+// Source of an XP grant. Lets the engagement modules that will build on XP
+// (greeting, raffles, quizzes, rumble, daily/streak) attribute every award and
+// drive an audit-friendly XP ledger. MANUAL = a dashboard/admin grant.
+enum XpEventSource {
+  MESSAGE
+  GREETING
+  RAFFLE
+  QUIZ
+  DAILY
+  STREAK
+  RUMBLE
+  MANUAL
+}
+
+// Raffle kind. FAST = quick XP giveaway with sane defaults; XP = XP prize (fixed
+// or a random range); ROLE = an existing Discord role granted to the winners;
+// WALLET = an off-chain crypto/token prize — the bot collects the winner's wallet
+// address after the draw (payout is manual; v1 only gathers claims).
+enum RaffleType {
+  FAST
+  XP
+  ROLE
+  WALLET
+}
+
+// Lifecycle of a wallet payout claim. PENDING = winner submitted an address,
+// awaiting a manual payout; SENT = a moderator paid it out; REJECTED = declined.
+enum WalletClaimStatus {
+  PENDING
+  SENT
+  REJECTED
+}
+
+// Raffle lifecycle. ACTIVE while accepting entries, ENDED once winners are drawn
+// and rewarded, CANCELLED if the owner aborts it before the draw.
+enum RaffleStatus {
+  ACTIVE
+  ENDED
+  CANCELLED
+}
+
+// Quiz question language. EN/RU render a single-language embed; BOTH shows the
+// question + answers bilingually. Purely presentational — the source text and
+// the questions themselves are whatever the owner provides.
+enum QuizLanguage {
+  EN
+  RU
+  BOTH
+}
+
+// Quiz difficulty. Advisory metadata surfaced in the dashboard/embed; it does
+// not change scoring (a future AI generator can use it to tune generation).
+enum QuizDifficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+// Quiz lifecycle. DRAFT = created in the builder (or generated), not yet posted;
+// ACTIVE = posted to a channel and accepting answers; CLOSED = results revealed.
+enum QuizStatus {
+  DRAFT
+  ACTIVE
+  CLOSED
+}
+
+// Rumble Arena battle lifecycle. JOINING while the join window is open and
+// accepting players; RUNNING while the bot is playing back the elimination
+// rounds; FINISHED once a winner is announced (and rewarded); CANCELLED if the
+// join window closed with fewer than the minimum players.
+enum RumbleStatus {
+  JOINING
+  RUNNING
+  FINISHED
+  CANCELLED
+}
+
+// Reward handed to a Rumble winner. XP = XP through the existing xp.service
+// (source RUMBLE); ROLE = an existing Discord role granted via the REST API;
+// NONE = a bragging-rights-only battle (no reward).
+enum RumbleRewardType {
+  XP
+  ROLE
+  NONE
+}
+
+// ── MODELS ───────────────────────────────────────────────────
+
+// ── MULTI-TENANCY, HOME LAYER ────────────────────────────────────────────────
+//
+// The home-layer member tables (User + everything that FKs to it) carry a
+// `guildId` so a single Discord person exists as a SEPARATE row per guild.
+// Part 1 (migration 20260724010000) added the columns + backfilled the home
+// guild. Part 2 (migration 20260724020000) made the composite key the ONLY
+// identity:
+//
+//   • `@@unique([guildId, discordId])` is THE identity key. The old global
+//     `discordId @unique` is DROPPED — the same person on two guilds is two
+//     independent rows.
+//   • `guildId` has NO default on User/WhitelistedUser/CaptchaSession: every
+//     create site passes it explicitly (bot events pass the event's guild id;
+//     API routers resolve it via resolveRequestGuildId with the home-guild
+//     fallback), so a forgotten site fails tsc instead of silently landing in
+//     the home guild.
+//   • The CHILD tables (Role, Warning, …) keep their home-guild @default as a
+//     denormalized-tenant-key safety net — their rows always hang off a User
+//     row (userId FK), which is what actually scopes them.
+//   • guildId → guilds FK is deliberately NOT added anywhere: Guild registry
+//     rows are created lazily by the bot (guildCreate / ready backfill), and
+//     the API may legitimately create home-layer rows before the bot has ever
+//     registered the guild on a fresh database.
+
+model User {
+  id                  String    @id @default(uuid())
+  discordId           String    @map("discord_id")
+  // Home-layer tenant key — half of the composite identity below.
+  guildId             String    @map("guild_id")
+  discordUsername     String    @map("discord_username")
+  // Captured from Discord at sign-in, with the customer's consent through the
+  // OAuth `email` scope. Without it there is no way to reach a server owner
+  // outside Discord — and a subscription notice that only exists in a DM the
+  // owner has muted is a notice nobody reads.
+  email               String?   @map("email")
+  // Dashboard RBAC level. null = no dashboard access. The Owner is always OWNER
+  // via config (OWNER_DISCORD_ID), independent of this column. Granted only by
+  // the Owner on the Access page; every change is written to the audit log.
+  accessLevel         AccessLevel? @map("access_level")
+  guestVerifiedAt     DateTime? @map("guest_verified_at")
+  region              String?
+  githubId            String?   @map("github_id")
+  githubUsername      String?   @map("github_username")
+  githubConnectedAt   DateTime? @map("github_connected_at")
+  // GitHub OAuth access token, encrypted at rest (AES-256-GCM). Used by the
+  // weekly recheck to re-verify the star via the authenticated GitHub API.
+  githubAccessToken   String?   @map("github_access_token")
+  // Discord account creation time, captured on join — used for risk scoring.
+  discordCreatedAt    DateTime? @map("discord_created_at")
+  walletAddress       String?   @map("wallet_address")
+  walletConnectedAt   DateTime? @map("wallet_connected_at")
+  // When the member left (or was kicked/banned from) the guild. null = currently
+  // in the guild. Set by the leave/kick/ban path, cleared on (re)join. The member
+  // list filters on this so departed members never linger as "active".
+  leftAt              DateTime? @map("left_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  roles                Role[]
+  roleHistory          RoleHistory[]
+  regionHistory        RegionHistory[]
+  captchaSessions      CaptchaSession[]
+  githubVerifications  GithubVerification[]
+  genesisVerifications GenesisVerification[]
+  warnings             Warning[]
+  protectionEvents     ProtectionEvent[]
+  timeouts             Timeout[]
+  contributionScore    ContributionScore?
+  riskScore            RiskScore?
+  channelActivity      ChannelActivity[]
+  dailyActivity        DailyActivity[]
+
+  // THE identity key: one row per (guild, person).
+  @@unique([guildId, discordId])
+  @@index([guildId])
+  @@map("users")
+}
+
+model Role {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  guildId   String @map("guild_id") // home-layer tenant key (Part 1)
+  roleName  RoleName  @map("role_name")
+  grantedAt DateTime  @default(now()) @map("granted_at")
+  grantedBy String    @map("granted_by")
+  reason    String
+  isActive  Boolean   @default(true) @map("is_active")
+  revokedAt DateTime? @map("revoked_at")
+  revokedBy String?   @map("revoked_by")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Uniqueness is enforced by a PARTIAL unique index (user_id, role_name) WHERE
+  // is_active = true — at most one ACTIVE row per role, but unlimited inactive
+  // history rows. Created in migration 20260607000100_roles_partial_unique. A
+  // plain @@unique([userId, roleName, isActive]) was wrong: it also forbade a
+  // second INACTIVE row, so deactivating a role a member previously held threw a
+  // unique violation and left the role stuck active. Prisma can't express partial
+  // indexes in the schema, so it lives in raw SQL.
+  @@index([guildId])
+  @@map("roles")
+}
+
+model RoleHistory {
+  id          String     @id @default(uuid())
+  userId      String     @map("user_id")
+  guildId     String @map("guild_id") // home-layer tenant key (Part 1)
+  roleName    RoleName   @map("role_name")
+  action      RoleAction
+  actor       String
+  reason      String
+  beforeState Json?      @map("before_state")
+  afterState  Json?      @map("after_state")
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("role_history")
+}
+
+model RegionHistory {
+  id         String   @id @default(uuid())
+  userId     String   @map("user_id")
+  guildId    String @map("guild_id") // home-layer tenant key (Part 1)
+  fromRegion String?  @map("from_region")
+  toRegion   String   @map("to_region")
+  changedBy  String   @map("changed_by")
+  reason     String
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("region_history")
+}
+
+model CaptchaSession {
+  id            String        @id @default(uuid())
+  discordId     String        @map("discord_id")
+  // Tenant key — half of the composite FK to User below. No default: the
+  // captcha service passes the guild explicitly.
+  guildId       String        @map("guild_id")
+  sessionToken  String        @unique @map("session_token")
+  challenge     String
+  answer        String
+  status        CaptchaStatus @default(PENDING)
+  ipFingerprint String?       @map("ip_fingerprint")
+  attempts      Int           @default(0)
+  createdAt     DateTime      @default(now()) @map("created_at")
+  completedAt   DateTime?     @map("completed_at")
+  expiresAt     DateTime      @map("expires_at")
+
+  // Composite FK onto the per-guild identity. Cascade matches the other child
+  // tables (SetNull is impossible — both columns are NOT NULL).
+  user User @relation(fields: [guildId, discordId], references: [guildId, discordId], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("captcha_sessions")
+}
+
+model GithubVerification {
+  id                      String             @id @default(uuid())
+  userId                  String             @map("user_id")
+  guildId                 String @map("guild_id") // home-layer tenant key (Part 1)
+  githubId                String             @map("github_id")
+  accountAgeDays          Int                @map("account_age_days")
+  hasAvatar               Boolean            @map("has_avatar")
+  hasPublicProfile        Boolean            @map("has_public_profile")
+  followsRequiredAccount  Boolean            @map("follows_required_account")
+  status                  VerificationStatus
+  checkedAt               DateTime           @default(now()) @map("checked_at")
+  nextRecheckAt           DateTime?          @map("next_recheck_at")
+  // Set when the verification is no longer valid for claiming (e.g. the user
+  // left the server). The claim freshness check rejects invalidated records.
+  invalidatedAt           DateTime?          @map("invalidated_at")
+  failureReason           String?            @map("failure_reason")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("github_verifications")
+}
+
+model GenesisVerification {
+  id            String             @id @default(uuid())
+  userId        String             @map("user_id")
+  guildId       String @map("guild_id") // home-layer tenant key (Part 1)
+  walletAddress String             @map("wallet_address")
+  chain         String
+  nftContract   String?            @map("nft_contract")
+  nftTokenId    String?            @map("nft_token_id")
+  status        VerificationStatus
+  verifiedAt    DateTime?          @map("verified_at")
+  revokedAt     DateTime?          @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("genesis_verifications")
+}
+
+model Warning {
+  id        String          @id @default(uuid())
+  userId    String          @map("user_id")
+  guildId   String @map("guild_id") // home-layer tenant key (Part 1)
+  reason    String
+  severity  WarningSeverity
+  channelId String?         @map("channel_id")
+  messageId String?         @map("message_id")
+  createdAt DateTime        @default(now()) @map("created_at")
+  expiresAt DateTime        @map("expires_at")
+  createdBy String          @map("created_by")
+  source    TimeoutSource
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("warnings")
+}
+
+model ProtectionEvent {
+  id          String              @id @default(uuid())
+  userId      String              @map("user_id")
+  guildId     String @map("guild_id") // home-layer tenant key (Part 1)
+  eventType   ProtectionEventType @map("event_type")
+  severity    Severity
+  channelId   String?             @map("channel_id")
+  messageId   String?             @map("message_id")
+  metadata    Json?
+  actionTaken ProtectionAction    @map("action_taken")
+  createdAt   DateTime            @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("protection_events")
+}
+
+model Timeout {
+  id              String        @id @default(uuid())
+  userId          String        @map("user_id")
+  guildId         String @map("guild_id") // home-layer tenant key (Part 1)
+  durationSeconds Int           @map("duration_seconds")
+  reason          String
+  startedAt       DateTime      @default(now()) @map("started_at")
+  endsAt          DateTime      @map("ends_at")
+  createdBy       String        @map("created_by")
+  source          TimeoutSource
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("timeouts")
+}
+
+model AuditLog {
+  id          String          @id @default(uuid())
+  actor       String
+  actorType   AuditActorType  @map("actor_type")
+  actionType  String          @map("action_type")
+  targetId    String?         @map("target_id")
+  targetType  AuditTargetType @map("target_type")
+  reason      String?
+  beforeState Json?           @map("before_state")
+  afterState  Json?           @map("after_state")
+  metadata    Json?
+  guildId     String          @map("guild_id")
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  @@map("audit_logs")
+}
+
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedBy String   @map("updated_by")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("system_settings")
+}
+
+model EmergencyEvent {
+  id          String          @id @default(uuid())
+  // Which server is locked down. Without this the whole module is one global
+  // switch: one server's emergency reads as every server's emergency, and the
+  // reason text — written by whoever triggered it — is served to all of them.
+  guildId     String          @map("guild_id")
+  status      EmergencyStatus
+  triggeredBy String          @map("triggered_by")
+  reason      String
+  startedAt   DateTime        @default(now()) @map("started_at")
+  endedAt     DateTime?       @map("ended_at")
+  metadata    Json?
+
+  @@index([guildId, status])
+  @@map("emergency_events")
+}
+
+model Backup {
+  id           String       @id @default(uuid())
+  type         BackupType
+  status       BackupStatus
+  fileReference String?     @map("file_reference")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  completedAt  DateTime?    @map("completed_at")
+  error        String?
+
+  @@map("backups")
+}
+
+// Per-user contribution / activity score. Int (not BigInt) for easy JSON.
+//   contributionScore = activityScore + builderScore + lifetimeScore + activeScore
+model ContributionScore {
+  userId            String    @id @map("user_id")
+  guildId           String @map("guild_id") // home-layer tenant key (Part 1)
+  messageCount      Int       @default(0) @map("message_count")     // raw lifetime messages
+  activityScore     Int       @default(0) @map("activity_score")    // points from messages (capped)
+  builderScore      Int       @default(0) @map("builder_score")     // bonus from active roles
+  lifetimeScore     Int       @default(0) @map("lifetime_score")    // tenure (days in community)
+  activeScore       Int       @default(0) @map("active_score")      // recency bonus
+  contributionScore Int       @default(0) @map("contribution_score") // total (headline)
+  lastMessageAt     DateTime? @map("last_message_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("contribution_scores")
+}
+
+// Per-user, per-channel activity counter. One row per (userId, channelId) —
+// incremented on each qualifying message (low-signal messages ≤3 chars are
+// skipped upstream), never one row per message. Powers the member card's
+// "where they post most" breakdown. channelName/categoryName are denormalized
+// snapshots refreshed on every increment so renames are reflected over time.
+model ChannelActivity {
+  id            String   @id @default(uuid())
+  userId        String   @map("user_id")
+  guildId       String @map("guild_id") // home-layer tenant key (Part 1)
+  channelId     String   @map("channel_id")
+  channelName   String   @map("channel_name")
+  categoryName  String?  @map("category_name")
+  messageCount  Int      @default(0) @map("message_count")
+  lastMessageAt DateTime @map("last_message_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, channelId])
+  @@index([userId])
+  @@index([guildId])
+  @@map("channel_activity")
+}
+
+// Per-user, per-DAY activity aggregate. One row per (userId, date) — a light
+// upsert/increment on each qualifying message (low-signal ≤3 chars skipped),
+// never one row per message. Splits messages by type (text / link / media) and
+// tags project-channel posts and global-chat messages, so the member card shows
+// a breakdown and the analytics view can sum any date range. Lives alongside
+// ChannelActivity (per-channel) and ContributionScore (lifetime score) without
+// replacing either.
+model DailyActivity {
+  id           String   @id @default(uuid())
+  userId       String   @map("user_id")
+  guildId      String @map("guild_id") // home-layer tenant key (Part 1)
+  date         DateTime @db.Date // the UTC day this bucket aggregates
+  messageCount Int      @default(0) @map("message_count") // total qualifying messages
+  textCount    Int      @default(0) @map("text_count")    // plain text (no link, no media)
+  linkCount    Int      @default(0) @map("link_count")    // contains an http(s) link
+  mediaCount   Int      @default(0) @map("media_count")   // attachments (photo/video/gif) or embeds
+  projectPosts Int      @default(0) @map("project_posts") // posts in a configured signal/showcase channel
+  globalCount  Int      @default(0) @map("global_count")  // messages in a configured global-chat channel
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@index([userId])
+  @@index([date])
+  @@index([guildId])
+  @@map("daily_activity")
+}
+
+// Snapshot of activity statistics taken at an "archive reset". Lets the owner
+// wipe current counters for a fresh start (e.g. at real launch, clearing test
+// data) while preserving the pre-reset numbers for later review. `snapshot`
+// holds a per-user aggregate array; `userCount`/`messageCount` are headline
+// totals for the list view. A "global reset" deletes these rows too (clean slate).
+model StatsArchive {
+  id           String   @id @default(uuid())
+  label        String?
+  reason       String?
+  createdBy    String   @map("created_by")
+  userCount    Int      @default(0) @map("user_count")
+  messageCount Int      @default(0) @map("message_count")
+  snapshot     Json     @default("[]")
+  metadata     Json?
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("stats_archives")
+}
+
+// Per-user risk score (0-100) with a factor breakdown. Computed at join and on
+// each protection violation. level: LOW (<30) / MEDIUM (30-59) / HIGH (>=60).
+model RiskScore {
+  userId    String   @id @map("user_id")
+  guildId   String @map("guild_id") // home-layer tenant key (Part 1)
+  score     Int      @default(0)
+  level     String   @default("LOW")
+  factors   Json     @default("{}")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([guildId])
+  @@map("risk_scores")
+}
+
+// Domain blacklist for scam/drainer link detection
+model BlacklistedDomain {
+  id        String   @id @default(uuid())
+  domain    String   @unique
+  reason    String
+  addedBy   String   @map("added_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("blacklisted_domains")
+}
+
+// One-time, server-side OAuth state tokens (CSRF protection for GitHub OAuth).
+// Generated when a user starts verification; consumed (deleted) in the callback.
+// discordId is read ONLY from here — never from the OAuth state value itself.
+model OAuthState {
+  id        String   @id @default(uuid())
+  state     String   @unique
+  discordId String   @map("discord_id")
+  // The guild the verification was started from. The GitHub callback carries no
+  // request guild context (it's a redirect from GitHub), so the guild must ride
+  // in this row. Default = home guild as insurance for rows created mid-deploy;
+  // /verify/github/start always writes it explicitly.
+  guildId   String @map("guild_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  expiresAt DateTime @map("expires_at")
+
+  @@map("oauth_states")
+}
+
+// DB-backed sliding-window trackers for protection (anti-spam / anti-raid /
+// duplicate detection). Replaces the in-memory Maps so counters survive bot
+// restarts and work across instances. One row per (scopeKey, kind):
+//   - MESSAGE: scopeKey = userId,  timestamps + parallel contents (for dup check)
+//   - JOIN:    scopeKey = guildId, timestamps only
+// expiresAt is used by the cleanup job to drop stale windows.
+model ProtectionTracker {
+  id         String   @id @default(uuid())
+  scopeKey   String   @map("scope_key")
+  kind       String
+  timestamps Json     @default("[]") // number[] (epoch ms) within the window
+  // One-way fingerprints of recent messages, parallel to timestamps (MESSAGE
+  // only). Duplicate detection needs equality and nothing else, so the text
+  // itself is never written down — a hash answers "same message again?"
+  // without the row ever holding anything readable.
+  contentHashes Json  @default("[]") @map("content_hashes")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+  expiresAt  DateTime @map("expires_at")
+
+  @@unique([scopeKey, kind])
+  @@index([expiresAt])
+  @@map("protection_trackers")
+}
+
+// Editable Discord panel configuration (welcome / regions / admin / future).
+// Drives the embed + components the bot posts, so panels can be edited from the
+// dashboard instead of code. One row per panel, keyed by panelKey.
+model PanelConfig {
+  id          String   @id @default(uuid())
+  panelKey    String   @unique @map("panel_key") // "welcome" | "regions" | "admin" | ...
+  enabled     Boolean  @default(true)
+  title       String
+  description String
+  bannerUrl   String?  @map("banner_url")        // embed image, nullable
+  color       String   @default("#5865F2")       // embed color as hex
+  // Array of button definitions: { id, label, style, url, enabled, order }.
+  // style ∈ PRIMARY | SECONDARY | SUCCESS | DANGER | LINK. LINK requires url.
+  buttons     Json     @default("[]")
+  // Panel-specific config: { component, footer, requiredRepo, placeholder, regions[] ... }
+  extraConfig Json?    @map("extra_config")
+  channelId   String?  @map("channel_id")        // target channel; null → ENV fallback
+  messageId   String?  @map("message_id")        // last published message (for edit on republish)
+  updatedBy   String   @default("SYSTEM") @map("updated_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("panel_configs")
+}
+
+// ── XP & LEVELS (engagement / gamification) ─────────────────────────────────
+//
+// A self-contained, multi-guild, SaaS-ready module that is DISABLED by default
+// per guild (XpSettings.enabled = false). It is deliberately DECOUPLED from the
+// existing contribution/risk scoring: contribution measures real "v/klad"
+// (lifetime activity + roles + tenure), XP measures gamified engagement. The
+// two never read or write each other's tables.
+//
+// All XP rows are keyed by (guildId, userId) where userId is the Discord user
+// id — no FK to the User table, so XP works for any guild the bot is in without
+// requiring a verified User row. No hardcoded guild/role ids live in code; every
+// row carries its guildId.
+
+// Per-guild XP configuration. One row per guild. Created lazily (disabled) on
+// first read. levelCurve is a JSON formula consumed by the level math in
+// xp.service (default: quadratic { a, b, c } → xp to advance level L = a*L^2 +
+// b*L + c).
+model XpSettings {
+  guildId           String   @id @map("guild_id")
+  enabled           Boolean  @default(false) // OFF by default per guild
+  xpPerMessage      Int      @default(15) @map("xp_per_message")
+  messageCooldownSec Int     @default(60) @map("message_cooldown_sec") // anti-spam: 1 award / N sec / user
+  dailyRewardAmount Int      @default(100) @map("daily_reward_amount")
+  streakBonus       Int      @default(25) @map("streak_bonus") // bonus per consecutive day
+  levelCurve        Json     @default("{\"type\":\"quadratic\",\"a\":5,\"b\":50,\"c\":100}") @map("level_curve")
+  leaderboardEnabled Boolean @default(true) @map("leaderboard_enabled")
+  // Optional channel the XP commands (/rank /daily /leaderboard) are restricted
+  // to. null = no restriction (commands work anywhere — backwards-compatible).
+  // When the Events Hub is created this is set to its check-rank channel, but it
+  // can also be overridden here. The bot resolves it (this OR the guild_channels
+  // "check-rank" mapping) so the binding is data-driven, never a hardcoded id.
+  xpChannelId       String?  @map("xp_channel_id")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@map("xp_settings")
+}
+
+// Per-(guild, member) XP state. userId = Discord user id. level is denormalized
+// (always recomputed from totalXp via the guild's curve) so leaderboards and
+// rank cards don't recompute on read.
+model MemberXp {
+  id              String    @id @default(uuid())
+  guildId         String    @map("guild_id")
+  userId          String    @map("user_id")
+  totalXp         Int       @default(0) @map("total_xp")
+  level           Int       @default(0)
+  currentStreak   Int       @default(0) @map("current_streak")
+  lastDailyAt     DateTime? @map("last_daily_at")
+  lastMessageXpAt DateTime? @map("last_message_xp_at") // cooldown anchor for message XP
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@unique([guildId, userId])
+  @@index([guildId, totalXp]) // leaderboard ordering
+  @@map("member_xp")
+}
+
+// Append-only ledger of every XP grant. Powers auditing and lets future modules
+// (raffles/quizzes/rumble) attribute their awards by source.
+model XpEvent {
+  id        String        @id @default(uuid())
+  guildId   String        @map("guild_id")
+  userId    String        @map("user_id")
+  source    XpEventSource
+  amount    Int
+  metadata  Json?
+  createdAt DateTime      @default(now()) @map("created_at")
+
+  @@index([guildId, userId])
+  @@index([guildId, createdAt])
+  @@map("xp_events")
+}
+
+// Reward role granted when a member reaches a given level in a guild. One role
+// per (guild, level). The bot/API grants it via the Discord API on level-up.
+model LevelRole {
+  id        String   @id @default(uuid())
+  guildId   String   @map("guild_id")
+  level     Int
+  roleId    String   @map("role_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([guildId, level])
+  @@index([guildId])
+  @@map("level_roles")
+}
+
+// ── EVENTS HUB (engagement infrastructure) ──────────────────────────────────
+//
+// One-click Discord scaffolding for the engagement modules (raffles, quizzes,
+// rumble, check-rank). The owner/ADMIN presses "Create Events Hub" in the
+// dashboard and the API creates a category + channels + (optional) access role +
+// permission overwrites + pinned intros, then records every created id here so
+// other modules can address those channels without hardcoding any id.
+//
+// Multi-guild, DISABLED by default per guild, fully idempotent: re-running the
+// create never duplicates channels (existing ones with the same name are reused).
+
+// Per-guild Events Hub record. One row per guild (guildId is the PK so a guild
+// can only have one hub — which is what makes "Create" idempotent).
+model EventHub {
+  guildId      String   @id @map("guild_id")
+  categoryId   String?  @map("category_id")    // the EVENTS HUB category channel id
+  accessRoleId String?  @map("access_role_id") // optional role gating the hub
+  logChannelId String?  @map("log_channel_id") // the event-logs channel id
+  enabled      Boolean  @default(false)        // OFF by default per guild
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@map("event_hubs")
+}
+
+// Maps a semantic channel "key" to the concrete Discord channel created for a
+// guild. key ∈ announcements | raffles | quizzes | check-rank | rumble | logs.
+// Other modules (XP check-rank binding, raffles, quizzes, rumble) look up their
+// channel by (guildId, key) instead of carrying a hardcoded id. name is a
+// denormalized snapshot of the channel name at creation/link time.
+model GuildChannel {
+  id        String   @id @default(uuid())
+  guildId   String   @map("guild_id")
+  key       String   // semantic key (see comment above)
+  channelId String   @map("channel_id")
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([guildId, key])
+  @@index([guildId])
+  @@map("guild_channels")
+}
+
+// Whitelisted users (exempt from protection). Per-guild: the same person can be
+// whitelisted on one server and not another.
+model WhitelistedUser {
+  id        String   @id @default(uuid())
+  discordId String   @map("discord_id")
+  guildId   String   @map("guild_id")
+  reason    String
+  addedBy   String   @map("added_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([guildId, discordId])
+  @@index([guildId])
+  @@map("whitelisted_users")
+}
+
+// ── GREETING SIGNAL (community signature greeting) ──────────────────────────
+//
+// Members post the community's signature word (e.g. "gArtSoul") in a dedicated
+// channel; the bot reacts, awards XP (via the existing XP system, source
+// GREETING) and keeps a per-user cooldown so the reward can't be farmed. An
+// optional STRICT mode allows ONLY the trigger word in the channel (anything
+// else is deleted / warned).
+//
+// Multi-guild, DISABLED by default per guild, no hardcoded ids — the channel,
+// trigger text, emoji, cooldown and reward all come from the dashboard.
+
+// Per-guild Greeting Signal configuration (one row per guild → guildId is the PK).
+model GreetingSignal {
+  guildId             String   @id @map("guild_id")
+  enabled             Boolean  @default(false) // OFF by default per guild
+  triggerText         String   @default("gm") @map("trigger_text")
+  caseInsensitive     Boolean  @default(true) @map("case_insensitive")
+  channelId           String?  @map("channel_id") // the greeting channel (null = not configured)
+  strictMode          Boolean  @default(false) @map("strict_mode") // only the trigger word is allowed
+  // Strict mode normally leaves moderators alone so staff can coordinate in the
+  // channel. Turn this off to police EVERYONE, owner included — otherwise the one
+  // person most likely to test it is the one person exempt from it.
+  strictExemptMods    Boolean  @default(true) @map("strict_exempt_mods")
+  deleteWrongMessages Boolean  @default(true) @map("delete_wrong_messages") // strict: delete non-trigger msgs
+  userCooldownSec     Int      @default(21600) @map("user_cooldown_sec") // 6h between rewarded greetings / user
+  reactionEmoji       String   @default("👋") @map("reaction_emoji")
+  xpReward            Int      @default(50) @map("xp_reward") // XP per rewarded greeting (0 = no XP)
+  successEmbedEnabled Boolean  @default(true) @map("success_embed_enabled")
+  // When on, a member who greets again too early gets a short auto-deleting reply
+  // telling them when they may greet next. Without it the cooldown is invisible —
+  // the bot simply ignores the message, which reads as "the bot is broken".
+  cooldownNoticeEnabled Boolean @default(true) @map("cooldown_notice_enabled")
+  // When on, the repeated greeting itself is deleted. The cooldown only ever
+  // withheld the reward, so without this the channel still fills with the same
+  // word over and over — which is exactly the spam the cooldown exists to stop.
+  deleteOnCooldown    Boolean  @default(false) @map("delete_on_cooldown")
+  // Native Discord slowmode for the greeting channel, in seconds (0 = off). This
+  // is deliberately INDEPENDENT of the cooldown: Discord counts every message and
+  // cannot read its content, so setting it to the full cooldown makes a typo cost
+  // the whole window. A small value (30–60s) instead gives flood protection that
+  // keeps working while the bot is offline, and leaves the real content-aware
+  // cooldown to the bot. Discord caps this at 6h.
+  channelSlowmodeSec  Int      @default(0) @map("channel_slowmode_sec")
+  warnOnWrong         Boolean  @default(true) @map("warn_on_wrong") // strict: DM/notify on a wrong message
+  logChannelId        String?  @map("log_channel_id") // optional channel for greeting logs
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  @@map("greeting_signals")
+}
+
+// Per-(guild, member) greeting claim state. Holds the last rewarded greeting time
+// (the effective cooldown anchor) and a running count for dashboard stats. One
+// row per member per guild — upserted on every rewarded greeting.
+model GreetingClaim {
+  id      String   @id @default(uuid())
+  guildId String   @map("guild_id")
+  userId  String   @map("user_id")
+  lastAt  DateTime @map("last_at") // last rewarded greeting (cooldown anchor)
+  count   Int      @default(0) // total rewarded greetings by this member
+
+  @@unique([guildId, userId])
+  @@index([guildId, lastAt]) // "greetings today" range scans
+  @@map("greeting_claims")
+}
+
+// ── RAFFLES (engagement / giveaways) ────────────────────────────────────────
+//
+// The owner creates a raffle in the dashboard; the bot posts an embed with an
+// "Enter" button in a channel; members click (one click = one entry); when the
+// timer expires an API cron fairly draws the winners (crypto RNG), posts a result
+// embed with @mentions and hands out the reward (XP via the existing xp.service,
+// or an existing Discord role via the REST API).
+//
+// Multi-guild, no hardcoded ids (channel/role/prize all come from the dashboard).
+// A raffle only exists once created, so there is no per-guild enabled toggle —
+// nothing runs until an owner makes one. Wallet-type + auto-raffles are Part 2.
+
+// One raffle. Reward columns are type-dependent (validated in the service):
+//   FAST → prizeXp (fixed XP, sane defaults)
+//   XP   → prizeXp (fixed) OR prizeXpMin..prizeXpMax (random per winner)
+//   ROLE → prizeRoleId (an existing Discord role; prizeRoleName is a display snapshot)
+model Raffle {
+  id               String       @id @default(uuid())
+  guildId          String       @map("guild_id")
+  type             RaffleType
+  title            String
+  description      String?
+  channelId        String       @map("channel_id")
+  messageId        String?      @map("message_id") // the posted embed (edited on end/cancel)
+  prizeXp          Int?         @map("prize_xp")        // fixed XP prize (FAST / XP)
+  prizeXpMin       Int?         @map("prize_xp_min")    // random-range floor (XP)
+  prizeXpMax       Int?         @map("prize_xp_max")    // random-range ceiling (XP)
+  prizeRoleId      String?      @map("prize_role_id")   // reward role (ROLE)
+  prizeRoleName    String?      @map("prize_role_name") // denormalized snapshot for the embed
+  walletChain      String?      @map("wallet_chain")         // WALLET: network label (e.g. "Base", "Solana")
+  walletPrizeAmount String?     @map("wallet_prize_amount")  // WALLET: prize text (e.g. "50 USDC")
+  walletNote       String?      @map("wallet_note")          // WALLET: extra note shown to winners
+  winnersCount     Int          @default(1) @map("winners_count")
+  requiredRoleName String?      @map("required_role_name") // entry gate: must hold this Discord role
+  minLevel         Int?         @map("min_level")          // entry gate: min XP level
+  endsAt           DateTime     @map("ends_at")
+  status           RaffleStatus @default(ACTIVE)
+  createdBy        String       @map("created_by")
+  createdAt        DateTime     @default(now()) @map("created_at")
+  endedAt          DateTime?    @map("ended_at")
+  // Throttle anchor for entrant-count embed edits (avoid a Discord edit per click).
+  lastCountAt      DateTime?    @map("last_count_at")
+
+  @@index([guildId, status])
+  @@index([status, endsAt]) // cron scan for due ACTIVE raffles
+  @@map("raffles")
+}
+
+// One entry per (raffle, member) — the unique index makes "one click one entry"
+// an invariant regardless of double-clicks or races.
+model RaffleEntry {
+  id        String   @id @default(uuid())
+  raffleId  String   @map("raffle_id")
+  guildId   String   @map("guild_id")
+  userId    String   @map("user_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([raffleId, userId])
+  @@index([raffleId])
+  @@map("raffle_entries")
+}
+
+// A drawn winner. prizeNote records what they actually received (e.g. "+150 XP"
+// or the role name) so the dashboard/audit shows the concrete reward per winner.
+model RaffleWinner {
+  id        String   @id @default(uuid())
+  raffleId  String   @map("raffle_id")
+  guildId   String   @map("guild_id")
+  userId    String   @map("user_id")
+  prizeNote String?  @map("prize_note")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([raffleId])
+  @@map("raffle_winners")
+}
+
+// A wallet payout claim for a WALLET-type raffle. After the draw, each winner is
+// prompted (via a "Claim prize" button → modal) to submit a wallet address; that
+// address is stored here for a moderator to pay out manually. One claim per
+// (raffle, member) — resubmitting updates the same row while still PENDING.
+model WalletClaim {
+  id            String            @id @default(uuid())
+  raffleId      String            @map("raffle_id")
+  guildId       String            @map("guild_id")
+  userId        String            @map("user_id")
+  walletAddress String            @map("wallet_address")
+  chain         String?           // network snapshot from the raffle (e.g. "Base")
+  prizeNote     String?           @map("prize_note") // prize text snapshot (e.g. "50 USDC")
+  status        WalletClaimStatus @default(PENDING)
+  createdAt     DateTime          @default(now()) @map("created_at")
+  updatedAt     DateTime          @updatedAt @map("updated_at")
+
+  @@unique([raffleId, userId])
+  @@index([guildId, status])
+  @@map("wallet_claims")
+}
+
+// Per-guild automatic/recurring raffle configuration (one row per guild → guildId
+// is the PK). When enabled, an API cron creates a raffle from the template at
+// randomized intervals (minPerWeek..maxPerWeek times a week) so it never looks
+// like predictable spam. nextRunAt is the scheduled next fire (persisted so the
+// schedule survives restarts). DISABLED by default; nothing runs until an owner
+// turns it on in the dashboard. Multi-guild, no hardcoded ids.
+model AutoRaffleSettings {
+  guildId                   String     @id @map("guild_id")
+  enabled                   Boolean    @default(false)
+  minPerWeek                Int        @default(1) @map("min_per_week")
+  maxPerWeek                Int        @default(3) @map("max_per_week")
+  // ── Raffle template (mirrors the manual create form) ──
+  templateType              RaffleType @default(FAST) @map("template_type")
+  templateTitle             String     @default("Community Giveaway") @map("template_title")
+  templateDescription       String?    @map("template_description")
+  templateDurationMinutes   Int        @default(120) @map("template_duration_minutes")
+  templateWinnersCount      Int        @default(10) @map("template_winners_count")
+  templatePrizeXp           Int?       @map("template_prize_xp")
+  templatePrizeXpMin        Int?       @map("template_prize_xp_min")
+  templatePrizeXpMax        Int?       @map("template_prize_xp_max")
+  templatePrizeRoleId       String?    @map("template_prize_role_id")
+  templatePrizeRoleName     String?    @map("template_prize_role_name")
+  templateWalletChain       String?    @map("template_wallet_chain")
+  templateWalletPrizeAmount String?    @map("template_wallet_prize_amount")
+  templateWalletNote        String?    @map("template_wallet_note")
+  channelId                 String?    @map("channel_id")
+  nextRunAt                 DateTime?  @map("next_run_at")
+  lastRunAt                 DateTime?  @map("last_run_at")
+  createdAt                 DateTime   @default(now()) @map("created_at")
+  updatedAt                 DateTime   @updatedAt @map("updated_at")
+
+  @@map("auto_raffle_settings")
+}
+
+// ── QUIZZES (project-knowledge trivia) ───────────────────────────────────────
+//
+// The owner stores a "project knowledge text" in the dashboard and builds quiz
+// questions from it — manually and/or via a simple, non-inventive generator that
+// only reuses words/sentences straight from that text (no external AI in v1, but
+// the generator lives behind an interface so an AI generator can be dropped in
+// later). The bot posts a question embed with A/B/C/D answer buttons; each member
+// answers once (unique), a correct answer awards XP via the existing xp.service
+// (source QUIZ). On close (timer or manual) the bot reveals the correct answer
+// and a small leaderboard of the first correct answers.
+//
+// Multi-guild, DISABLED by default per guild, no hardcoded ids — language,
+// difficulty, reward, cooldown and channel all come from the dashboard.
+
+// Per-guild Quizzes configuration (one row per guild → guildId is the PK).
+model QuizSettings {
+  guildId             String         @id @map("guild_id")
+  enabled             Boolean        @default(false) // OFF by default per guild
+  knowledgeText       String?        @map("knowledge_text") // the ONLY source for generated questions
+  language            QuizLanguage   @default(EN)
+  difficulty          QuizDifficulty @default(MEDIUM)
+  optionsCount        Int            @default(4) @map("options_count") // answer choices per generated question (2–6)
+  xpReward            Int            @default(50) @map("xp_reward")      // XP for a correct answer
+  userCooldownSec     Int            @default(0) @map("user_cooldown_sec") // min gap between a member's answers across quizzes
+  durationMinutes     Int?           @map("duration_minutes")  // auto-close a posted quiz after N minutes (null = manual close only)
+  channelId           String?        @map("channel_id")        // where quizzes are posted (suggestion from Events Hub)
+  autoScheduleEnabled Boolean        @default(false) @map("auto_schedule_enabled")
+  autoIntervalHours   Int            @default(24) @map("auto_interval_hours") // frequency for the auto-scheduler
+  nextRunAt           DateTime?      @map("next_run_at")
+  lastRunAt           DateTime?      @map("last_run_at")
+  createdAt           DateTime       @default(now()) @map("created_at")
+  updatedAt           DateTime       @updatedAt @map("updated_at")
+
+  @@map("quiz_settings")
+}
+
+// A single quiz question. Created MANUAL (dashboard form) or GENERATED (from the
+// knowledge text). Lives as DRAFT in the builder until published, when it is
+// posted to a channel and flipped ACTIVE; CLOSED once results are revealed.
+// `options` is a JSON string array; `correctIndex` points into it.
+model Quiz {
+  id           String     @id @default(uuid())
+  guildId      String     @map("guild_id")
+  question     String
+  options      Json // string[] of answer choices
+  correctIndex Int        @map("correct_index")
+  source       String     @default("MANUAL") // MANUAL | GENERATED (free text so an AI source can be added)
+  status       QuizStatus @default(DRAFT)
+  channelId    String?    @map("channel_id") // channel it was posted to (snapshot at publish)
+  messageId    String?    @map("message_id") // the posted embed (edited on close)
+  postedAt     DateTime?  @map("posted_at")
+  closesAt     DateTime?  @map("closes_at") // auto-close time (null = manual only)
+  closedAt     DateTime?  @map("closed_at")
+  createdBy    String     @map("created_by")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  @@index([guildId, status])
+  @@index([status, closesAt]) // cron scan for due ACTIVE quizzes
+  @@map("quizzes")
+}
+
+// One answer per (quiz, member) — the unique index makes "one answer per user"
+// an invariant regardless of double-clicks or races. `correct` is snapshotted so
+// results/stats never need to re-read the quiz.
+model QuizAnswer {
+  id          String   @id @default(uuid())
+  quizId      String   @map("quiz_id")
+  guildId     String   @map("guild_id")
+  userId      String   @map("user_id")
+  optionIndex Int      @map("option_index")
+  correct     Boolean
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@unique([quizId, userId])
+  @@index([quizId])
+  @@map("quiz_answers")
+}
+
+// ── RUMBLE ARENA (battle mini-game) ─────────────────────────────────────────
+//
+// The bot posts an invitation to a battle with a "Join" button and a countdown;
+// members join during the join window; when it closes an API cron plays the
+// battle back round by round, randomly eliminating 2–4 players per round with
+// short, funny event lines (RU/EN per the guild language) until one winner
+// remains; the winner is announced (with a top-3) and rewarded (XP via the
+// existing xp.service, source RUMBLE, or an existing Discord role).
+//
+// Multi-guild, DISABLED by default per guild, no hardcoded ids — the channel,
+// join window, min/max players, reward and cooldown all come from the dashboard.
+// A battle can be launched by hand ("Start battle now") or by an optional
+// per-guild auto-scheduler. To stay well under Discord's rate limits the round
+// messages are throttled (one edit every few seconds, never per-event).
+
+// Per-guild Rumble Arena configuration (one row per guild → guildId is the PK).
+model RumbleSettings {
+  guildId             String           @id @map("guild_id")
+  enabled             Boolean          @default(false) // OFF by default per guild
+  channelId           String?          @map("channel_id") // where battles are posted (Events Hub "rumble-arena" suggestion)
+  joinWindowSec       Int              @default(120) @map("join_window_sec") // how long the Join button stays open
+  minPlayers          Int              @default(3) @map("min_players")        // fewer than this at close → cancelled
+  maxPlayers          Int              @default(50) @map("max_players")        // join is refused past this
+  rewardType          RumbleRewardType @default(NONE) @map("reward_type")
+  rewardXp            Int?             @map("reward_xp")      // XP prize (rewardType XP)
+  rewardRoleId        String?          @map("reward_role_id")   // reward role (rewardType ROLE)
+  rewardRoleName      String?          @map("reward_role_name") // denormalized snapshot for the embed
+  cooldownSec         Int              @default(0) @map("cooldown_sec") // min gap between battles (0 = none)
+  autoScheduleEnabled Boolean          @default(false) @map("auto_schedule_enabled")
+  autoIntervalHours   Int              @default(24) @map("auto_interval_hours") // frequency for the auto-scheduler
+  nextRunAt           DateTime?        @map("next_run_at")
+  lastRunAt           DateTime?        @map("last_run_at")
+  createdAt           DateTime         @default(now()) @map("created_at")
+  updatedAt           DateTime         @updatedAt @map("updated_at")
+
+  @@map("rumble_settings")
+}
+
+// One battle. The gameplay parameters (window / min / max / reward) are snapshotted
+// from the settings at creation so a mid-battle settings change never alters the
+// battle in flight — the same pattern the raffle row uses.
+model RumbleGame {
+  id             String           @id @default(uuid())
+  guildId        String           @map("guild_id")
+  status         RumbleStatus     @default(JOINING)
+  channelId      String           @map("channel_id")
+  messageId      String?          @map("message_id") // the invitation embed (edited through the battle)
+  joinEndsAt     DateTime         @map("join_ends_at") // when the join window closes (cron scan anchor)
+  minPlayers     Int              @map("min_players")  // snapshot
+  maxPlayers     Int              @map("max_players")  // snapshot
+  rewardType     RumbleRewardType @map("reward_type")  // snapshot
+  rewardXp       Int?             @map("reward_xp")
+  rewardRoleId   String?          @map("reward_role_id")
+  rewardRoleName String?          @map("reward_role_name")
+  winnerUserId   String?          @map("winner_user_id")
+  playerCount    Int              @default(0) @map("player_count")
+  startedBy      String           @map("started_by") // discordId / SYSTEM / AUTO
+  startedAt      DateTime         @default(now()) @map("started_at")
+  finishedAt     DateTime?        @map("finished_at")
+  // Throttle anchor for join-count embed edits (avoid a Discord edit per click).
+  lastCountAt    DateTime?        @map("last_count_at")
+
+  @@index([guildId, status])
+  @@index([status, joinEndsAt]) // cron scan for due JOINING games
+  @@map("rumble_games")
+}
+
+// One player per (game, member) — the unique index makes "one join per member"
+// an invariant regardless of double-clicks or races. eliminatedRound records the
+// round a player was knocked out (null = the winner / still standing).
+model RumblePlayer {
+  id              String   @id @default(uuid())
+  gameId          String   @map("game_id")
+  guildId         String   @map("guild_id")
+  userId          String   @map("user_id")
+  eliminatedRound Int?     @map("eliminated_round")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@unique([gameId, userId])
+  @@index([gameId])
+  @@map("rumble_players")
+}
+
+// Records that a server Template was installed into a guild. One row per
+// (guildId, templateKey) so re-installing the same template updates the same
+// record (idempotent, like the Events Hub). resultJson is the structured report
+// of what was created / reused / skipped PLUS the resolved Discord ids, so a
+// re-install can reuse a previously-created category/channel/role by saved id
+// before falling back to name matching. Template DEFINITIONS live in code
+// (templates.data.ts) — this table only records installations, never private
+// owner data.
+model InstalledTemplate {
+  id          String   @id @default(uuid())
+  guildId     String   @map("guild_id")
+  templateKey String   @map("template_key")
+  resultJson  Json?    @map("result_json")
+  installedAt DateTime @default(now()) @map("installed_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@unique([guildId, templateKey])
+  @@index([guildId])
+  @@map("installed_templates")
+}
+
+// ── PLAN LIMITS (subscription gates) ────────────────────────────────────────
+//
+// One row per guild recording its subscription tier. The per-plan limits (raffles
+// per month, auto-raffles, templates, log retention, branding, …) are defined in
+// code (packages/shared/plans.ts) — the single source of truth — so changing a
+// limit never needs a migration. There is NO payment provider: `plan` is set
+// manually by the system owner from the dashboard. `activeUntil` is an optional
+// expiry; when it is in the past the effective plan falls back to FREE (computed
+// in code, never mutated here). A guild with no row is treated as FREE.
+model GuildSubscription {
+  guildId    String           @id @map("guild_id")
+  plan       SubscriptionPlan @default(FREE)
+  activeUntil DateTime?       @map("active_until") // optional expiry; past → FREE
+  updatedBy  String?          @map("updated_by")   // discordId of who last changed it
+  // ── Free trial (3-day PREMIUM, opt-in) ────────────────────────────────────
+  // Started from a button, not at install: three days handed out automatically
+  // are spent before anyone opens the dashboard. `plan` becomes PREMIUM with
+  // `activeUntil = trialEndsAt`, so the ordinary expiry path applies and there is
+  // no separate trial cron. `trialUsed` latches true forever, so a trial can
+  // never be granted twice even if the bot is removed and re-added.
+  trialStartedAt DateTime? @map("trial_started_at")
+  trialEndsAt    DateTime? @map("trial_ends_at")
+  trialUsed      Boolean   @default(false) @map("trial_used")
+  // ── Scheduled plan change ─────────────────────────────────────────────────
+  // Buying a plan at or below the one currently running must not cut the paid
+  // time short, so the purchase is parked here and takes effect when the current
+  // plan expires. With a single paid tier nothing reaches this today, but the
+  // rule is what stops a purchase from ever leaving someone worse off.
+  pendingPlan   SubscriptionPlan? @map("pending_plan")
+  pendingMonths Int?              @map("pending_months")
+  // ── Lapse handling ────────────────────────────────────────────────────────
+  // The last lifecycle stage this guild was told about ("grace" | "lapsed" |
+  // "reset"). Latched so a restart, a double run, or a crash mid-sweep cannot
+  // send the same warning twice or clear settings twice. Reset to null on
+  // renewal, so a guild that lapses again is warned again.
+  lifecycleNotified String? @map("lifecycle_notified")
+  createdAt  DateTime         @default(now()) @map("created_at")
+  updatedAt  DateTime         @updatedAt @map("updated_at")
+
+  @@map("guild_subscriptions")
+}
+
+// ── MULTI-TENANCY (guild registry + access) ─────────────────────────────────
+//
+// The bot is multi-tenant: it can be added to any number of Discord servers. Two
+// tables make that safe:
+//
+//   Guild        — the registry of every server the bot is in. Created on
+//                  `guildCreate` (or backfilled on `ready`), flipped inactive on
+//                  `guildDelete` (data is NEVER deleted — a re-add restores it).
+//   GuildManager — which dashboard user may manage which guild. Computed at OAuth
+//                  login from the user's Discord permissions (guild owner OR
+//                  Administrator/Manage-Server) intersected with the guilds the
+//                  bot is actually in. The configured system Owner bypasses this
+//                  entirely; home-guild TEAM admins keep managing the home guild
+//                  through the existing RBAC path.
+//
+// DISCORD_GUILD_ID (the optional "home guild") is NOT modeled here — it stays an
+// env concern. These tables are what every other guild relies on for provisioning
+// and isolation.
+
+model Guild {
+  id          String    @id @map("guild_id") // Discord guild id
+  name        String?
+  iconHash    String?   @map("icon_hash")
+  ownerId     String?   @map("owner_id")      // Discord user id of the guild owner
+  memberCount Int?      @map("member_count")
+  // false once the bot is removed (guildDelete). Rows are kept so re-adding the
+  // bot restores all settings/history; the crons and dashboard filter on active.
+  active      Boolean   @default(true)
+  botJoinedAt DateTime  @default(now()) @map("bot_joined_at")
+  botLeftAt   DateTime? @map("bot_left_at")
+  // Optional free-trial expiry started at first join. null = no trial window.
+  trialEndsAt DateTime? @map("trial_ends_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  @@index([active])
+  @@map("guilds")
+}
+
+model GuildManager {
+  id        String   @id @default(uuid())
+  discordId String   @map("discord_id") // dashboard user (Discord user id)
+  guildId   String   @map("guild_id")
+  // true = may manage this guild's modules from the dashboard. A row only exists
+  // for guilds the bot is in where the user is owner/admin, recomputed at login.
+  canManage Boolean  @default(true) @map("can_manage")
+  isOwner   Boolean  @default(false) @map("is_owner") // Discord guild owner (not the system Owner)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([discordId, guildId])
+  @@index([discordId])
+  @@index([guildId])
+  @@map("guild_managers")
+}
+
+// ── HOME-LAYER CONFIG MAPPING (Part 3) ───────────────────────────────────────
+//
+// Maps a home-stack LOGICAL role/channel key to the concrete Discord id FOR A
+// GUILD, so the verification/regions/protection/scoring/RBAC/panels modules stop
+// depending on env ROLE_*/CHANNEL_* and instead resolve their ids per-guild from
+// the dashboard. This is what lets a CLIENT run the home stack on their own
+// server: they map their own Discord roles/channels to the logical keys.
+//
+//   • logicalKey ∈ the role names (GUEST/BUILDER/EARLY/GENESIS/TEAM, the 9
+//     regions, HELPER_*) or a custom key; channels ∈ VERIFY/REGIONAL/GENERAL/
+//     LOGS or custom.
+//   • Unique (guildId, logicalKey): one Discord id per logical key per guild.
+//   • The HOME guild is backfilled from env at startup so it reads from the DB;
+//     the resolver still falls back to env for the home guild if a row is
+//     missing, so the home server can never break. Other guilds are DB-only.
+//   • No guildId → guilds FK, matching the rest of the home layer (registry rows
+//     are created lazily by the bot).
+
+model GuildRoleMap {
+  id            String   @id @default(uuid())
+  guildId       String   @map("guild_id")
+  logicalKey    String   @map("logical_key")
+  discordRoleId String   @map("discord_role_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@unique([guildId, logicalKey])
+  @@index([guildId])
+  @@map("guild_role_map")
+}
+
+model GuildChannelMap {
+  id         String   @id @default(uuid())
+  guildId    String   @map("guild_id")
+  logicalKey String   @map("logical_key")
+  channelId  String   @map("channel_id")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([guildId, logicalKey])
+  @@index([guildId])
+  @@map("guild_channel_map")
+}
+
+// ── PER-GUILD BRANDING (white-label) ─────────────────────────────────────────
+//
+// Every embed the bot posts and the dashboard header use the branding of the
+// guild they belong to, so a client that adds the bot sees THEIR own name/colour
+// and NONE of the operator's. One row per guild; all columns nullable so the
+// resolver (branding.service) can fall back to a NEUTRAL default (the guild's own
+// Discord name) — never the operator's brand. The home guild is seeded with the
+// operator's own brand so its server looks unchanged. No hardcoded ids/strings.
+model GuildBranding {
+  guildId     String   @id @map("guild_id")
+  displayName String?  @map("display_name") // null → neutral default (guild name)
+  embedColor  String?  @map("embed_color")  // hex "#8b5cf6"; null → neutral default
+  footerText  String?  @map("footer_text")  // null → defaults to displayName
+  logoUrl     String?  @map("logo_url")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("guild_branding")
+}
+
+// ── GENESIS / NFT VERIFICATION (optional module) ─────────────────────────────
+//
+// NFT-holder verification is an OPT-IN module, DISABLED by default per guild.
+// When disabled the dashboard, panels and bot show NO Genesis/NFT wording at all.
+// When enabled the client supplies their own chain + contract + which logical role
+// holders receive. The home guild is seeded enabled with the operator's values.
+model GenesisSettings {
+  guildId         String   @id @map("guild_id")
+  enabled         Boolean  @default(false) // OFF by default per guild
+  chainId         String?  @map("chain_id")
+  contractAddress String?  @map("contract_address")
+  roleKey         String?  @map("role_key") // logical role granted to holders (default GENESIS)
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("genesis_settings")
+}
+
+// ── GITHUB BUILDER VERIFICATION (optional module) ────────────────────────────
+//
+// GitHub-based "Builder" verification is an OPT-IN module, DISABLED by default
+// per guild. A new client sees the feature but the repo/owner fields are empty
+// ("requires configuration"). The home guild is seeded enabled with the operator's
+// repo (sourced from env, never a hardcoded literal).
+model GithubBuilderSettings {
+  guildId       String   @id @map("guild_id")
+  enabled       Boolean  @default(false) // OFF by default per guild
+  requiredRepo  String?  @map("required_repo")  // "owner/repo" the user must star
+  ownerUsername String?  @map("owner_username") // account the user must follow
+  minAccountAgeDays Int  @default(180) @map("min_account_age_days")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("github_builder_settings")
+}
+
+// ── Crypto payments ──────────────────────────────────────────────────────────
+//
+// Subscriptions are paid by a direct stablecoin transfer to the operator's own
+// wallet — no payment processor, no fees beyond gas, nothing to get deplatformed.
+// A single operator-level row: this is the seller's wallet, not a per-guild one.
+model CryptoPaymentConfig {
+  id           String   @id @default("default") // single row
+  enabled      Boolean  @default(false)
+  // Where customers send funds.
+  payToAddress String?  @map("pay_to_address")
+  chainName    String   @default("Base") @map("chain_name")   // shown to the customer
+  chainId      Int      @default(8453) @map("chain_id")
+  // The accepted token. A stablecoin keeps "$14" meaning $14 with no oracle.
+  tokenSymbol   String  @default("USDC") @map("token_symbol")
+  tokenAddress  String? @map("token_address")
+  tokenDecimals Int     @default(6) @map("token_decimals")
+  minConfirmations Int  @default(3) @map("min_confirmations")
+  // Paying in the chain's own coin. A stablecoin needs no exchange rate; the
+  // native coin does, so an invoice priced in it is quoted from a price feed and
+  // that quote is frozen into the invoice. Off unless a feed is configured.
+  acceptNative     Boolean @default(false) @map("accept_native")
+  nativeSymbol     String  @default("ETH") @map("native_symbol")
+  nativeDecimals   Int     @default(18) @map("native_decimals")
+  // Chainlink-style aggregator answering latestRoundData() in USD.
+  priceFeedAddress String? @map("price_feed_address")
+  updatedBy     String? @map("updated_by")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("crypto_payment_config")
+}
+
+// Which asset an invoice is denominated in. A token invoice is settled by ERC-20
+// Transfer logs; a native one by the transaction's own value field.
+enum PayCurrency {
+  TOKEN
+  NATIVE
+}
+
+enum PaymentIntentStatus {
+  PENDING
+  CONFIRMED
+  EXPIRED
+  REJECTED
+}
+
+// One attempt to pay for a plan. The submitted txHash identifies the transfer,
+// and its unique constraint prevents the same payment from being redeemed twice.
+model PaymentIntent {
+  id           String   @id @default(uuid())
+  guildId      String   @map("guild_id")
+  plan         SubscriptionPlan
+  months       Int      @default(1)          // 1 = monthly, 12 = yearly
+  amountExact  String   @map("amount_exact") // decimal string, e.g. "14"
+  tokenSymbol  String   @map("token_symbol")
+  chainName    String   @map("chain_name")
+  chainId      Int?     @map("chain_id")
+  tokenAddress String?  @map("token_address")
+  tokenDecimals Int?    @map("token_decimals")
+  minConfirmations Int? @map("min_confirmations")
+  payToAddress String   @map("pay_to_address")
+  // TOKEN invoices carry the token's address above; NATIVE ones leave it null and
+  // are settled against the transaction's value. `usdPrice` and `quotedRate`
+  // record what the native amount was derived from, so a disputed invoice can be
+  // reconstructed instead of argued about.
+  payCurrency  PayCurrency @default(TOKEN) @map("pay_currency")
+  usdPrice     String?  @map("usd_price")
+  quotedRate   String?  @map("quoted_rate")
+  status       PaymentIntentStatus @default(PENDING)
+  txHash       String?  @unique @map("tx_hash")
+  // The wallet the customer said they would pay from, captured when the invoice
+  // is issued. Transactions are public, so without this anyone could lift a hash
+  // off the chain and redeem someone else's transfer against their own invoice —
+  // first claim wins. Binding the invoice to a sender makes a stolen hash useless.
+  expectedFrom String?  @map("expected_from")
+  fromAddress  String?  @map("from_address")
+  rejectReason String?  @map("reject_reason")
+  createdBy    String   @map("created_by")   // discordId who started the payment
+  expiresAt    DateTime @map("expires_at")
+  confirmedAt  DateTime? @map("confirmed_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  transactions PaymentTransaction[]
+
+  @@index([guildId, status])
+  @@index([status, expiresAt])
+  @@map("payment_intents")
+}
+
+// Each accepted transfer against an invoice.
+//
+// One invoice used to mean one transaction: anything short of the full price was
+// rejected outright and the money stayed on-chain with nothing to show for it.
+// Recording transfers individually lets a customer who underpaid send the rest
+// and have the two add up, which is the only way an underpayment ends with the
+// customer holding what they paid for.
+//
+// `txHash` is unique across the whole table, so the same transfer can never be
+// counted twice — not against one invoice, and not against two.
+model PaymentTransaction {
+  id          String   @id @default(uuid())
+  intentId    String   @map("intent_id")
+  txHash      String   @unique @map("tx_hash")
+  // Smallest token units, as a decimal string: the value is a uint256 on-chain
+  // and must not pass through a float on its way into the database.
+  amount      String
+  fromAddress String   @map("from_address")
+  blockNumber String   @map("block_number")
+  confirmedAt DateTime @default(now()) @map("confirmed_at")
+
+  intent PaymentIntent @relation(fields: [intentId], references: [id], onDelete: Cascade)
+
+  @@index([intentId])
+  @@map("payment_transactions")
+}
