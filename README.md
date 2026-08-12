@@ -1,7 +1,8 @@
 # ArtSoul OS — the parts worth checking
 
-[ArtSoul OS](https://artsoul-os.com) is a Discord bot that charges money in
-cryptocurrency. From the outside that looks exactly like something you should be
+[ArtSoul OS](https://artsoul-os.com) — *Operating System*, for a Discord
+community: the layer a server runs on instead of six separate bots — is a
+Discord bot that charges money in cryptocurrency. From the outside that looks exactly like something you should be
 careful with, and it should.
 
 This repository exists so the claims on
