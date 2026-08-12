@@ -37,14 +37,23 @@ through a Chainlink feed. Every value it compares comes from the chain.
 against the invoice rather than being rejected. **"A transaction cannot be
 reused."** Each hash is recorded once and refused thereafter.
 
-**"Message content is never stored."** This is the claim that was wrong until
-recently, and the honest version is worth stating precisely. The duplicate-spam
-filter has to recognise the same message sent twice. It used to keep the text to
-do that. It now keeps a truncated one-way hash: enough for an equality test,
-useless for reading. The window is seconds long. `protection-tracker-privacy.test.ts`
-is the guard, and the commit that changed it is in the history of the private
-repository; the column rename from `contents` to `content_hashes` is visible in
-`schema.prisma`.
+**"Message content is never stored."** This was wrong until recently, and the
+honest version is worth stating precisely, including the limits of what is
+proven here.
+
+*The claim:* ArtSoul OS does not persist the body of a Discord message.
+
+*The evidence in this repository:* the complete schema, which has no column that
+could hold one; `protection.tracker.ts`, the one component that has ever received
+message text, which now keeps a truncated one-way hash rather than the text; and
+`protection-tracker-privacy.test.ts`, which feeds it a message full of
+recognisable secrets and asserts that no fragment survives into what is written.
+The column rename from `contents` to `content_hashes` is visible in the schema.
+
+*What this cannot prove:* the rest of the bot is closed, so these files
+demonstrate the claim rather than establishing it for every line we have not
+published. The schema is the strongest part of the argument, because a value has
+to be stored somewhere and there is nowhere for it to go.
 
 **"We store the minimum."** The schema is complete and unedited. There is no
 column anywhere that holds the body of a message. XP counts that a message
@@ -61,12 +70,24 @@ us.
 
 ## No audit badge
 
-There is no third-party security audit and we would rather say so than buy a
-badge. Audits are meaningful for smart contracts that hold funds; this product
-has no contract and holds none, so an audit would inspect nothing that could
-take your money. What is checkable is here, plus two things that are public
-anyway: the payout address, shown before you pay, and the permission list
+There is no third-party security audit yet, and we would rather say that than
+buy a badge.
+
+Being non-custodial removes one class of risk: there is no contract holding
+funds and no balance to drain. It is worth being precise about what it does not
+remove. A review would still have plenty to look at, and some of it is the part
+that matters most here: authorisation between one customer's server and
+another's, session handling and OAuth, the payment verification in this
+repository, privilege escalation through the access levels, and the
+infrastructure underneath. We intend to have that review.
+
+Until then, what is checkable is in this repository, plus two things that are
+public anyway: the payout address, shown before you pay, and the permission list
 Discord itself presents before you add the bot.
+
+The bot carries Discord's verified badge. That is an identity check on the team
+behind the app and the thing that lets it grow past 100 servers. It is not a
+security audit and we do not present it as one.
 
 ## Reporting something
 
