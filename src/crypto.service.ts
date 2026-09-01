@@ -632,6 +632,7 @@ async function extendSubscription(
       // be warned the second time too.
       lifecycleNotified: null,
       updatedBy: "CRYPTO_PAYMENT",
+      source: "CRYPTO",
     },
     create: {
       guildId,
@@ -640,6 +641,7 @@ async function extendSubscription(
       pendingPlan: (change.pendingPlan as never) ?? null,
       pendingMonths: change.pendingMonths,
       updatedBy: "CRYPTO_PAYMENT",
+      source: "CRYPTO",
     },
   });
 }

@@ -57,6 +57,16 @@ enum SubscriptionPlan {
   PREMIUM
 }
 
+// Where the paid time came from. Not bookkeeping: it decides what we are allowed
+// to say to the customer. A crypto subscription ends unless the person acts, so
+// it earns a "renew" email; a Discord subscription renews itself, and telling
+// that customer to renew is telling them to do something Discord already did.
+enum SubscriptionSource {
+  CRYPTO   // a transfer on Base, verified against the chain
+  DISCORD  // a Premium App subscription, billed by Discord
+  GRANT    // handed out by us: a trial, a pilot server, a goodwill extension
+}
+
 // Dashboard access level (RBAC). Ordered by ascending privilege. A user with a
 // null accessLevel has NO dashboard access. The Owner (discordId from config) is
 // always treated as OWNER regardless of this field. Critical/destructive actions
@@ -612,6 +622,7 @@ model DailyActivity {
   linkCount    Int      @default(0) @map("link_count")    // contains an http(s) link
   mediaCount   Int      @default(0) @map("media_count")   // attachments (photo/video/gif) or embeds
   projectPosts Int      @default(0) @map("project_posts") // posts in a configured signal/showcase channel
+  showcaseLinks Int     @default(0) @map("showcase_links") // of those, the ones carrying a link — the EARLY criterion
   globalCount  Int      @default(0) @map("global_count")  // messages in a configured global-chat channel
   updatedAt    DateTime @updatedAt @map("updated_at")
 
@@ -621,6 +632,10 @@ model DailyActivity {
   @@index([userId])
   @@index([date])
   @@index([guildId])
+  // The shape every automatic-role sweep and every activity chart asks for:
+  // one guild, a window of days. Postgres can answer that from this index alone
+  // instead of taking every row the guild ever wrote and filtering by date.
+  @@index([guildId, date])
   @@map("daily_activity")
 }
 
@@ -1302,6 +1317,15 @@ model GuildSubscription {
   // send the same warning twice or clear settings twice. Reset to null on
   // renewal, so a guild that lapses again is warned again.
   lifecycleNotified String? @map("lifecycle_notified")
+  // ── Where the money comes from ────────────────────────────────────────────
+  // Null on a FREE row that never paid. Set by whichever writer granted the
+  // current paid window, and read wherever the answer changes what we do:
+  // the expiry email, and the billing page, which must not offer a payment
+  // address to somebody whose card Discord is already charging.
+  source     SubscriptionSource? @map("source")
+  // The Discord entitlement behind a DISCORD subscription, so a delete event
+  // can be matched to the guild it belongs to and applied exactly once.
+  discordEntitlementId String? @unique @map("discord_entitlement_id")
   createdAt  DateTime         @default(now()) @map("created_at")
   updatedAt  DateTime         @updatedAt @map("updated_at")
 
@@ -1554,6 +1578,22 @@ model PaymentIntent {
   @@map("payment_intents")
 }
 
+// Where the payment watcher stopped reading the chain.
+//
+// One row. Without it the watcher would either re-read the whole chain every
+// minute or, worse, guess — and a guess that goes backwards credits a transfer
+// twice while a guess that goes forwards loses one silently. The cursor is only
+// advanced past blocks that have been processed AND are deep enough that a
+// reorganisation cannot take them back.
+model PaymentScanCursor {
+  id         String   @id @default("default")
+  lastBlock  String   @map("last_block")   // decimal string; block numbers outgrow Int
+  scannedAt  DateTime @default(now()) @map("scanned_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("payment_scan_cursor")
+}
+
 // Each accepted transfer against an invoice.
 //
 // One invoice used to mean one transaction: anything short of the full price was
@@ -1579,4 +1619,113 @@ model PaymentTransaction {
 
   @@index([intentId])
   @@map("payment_transactions")
+}
+
+// ── Automatic roles ──────────────────────────────────────────────────────────
+//
+// A server sets a bar and the bot keeps the role honest: it hands the role out
+// to whoever clears the bar over the chosen window, and takes it back from
+// whoever stops clearing it. Any Discord role, any window, any numbers — the
+// rules live here, one row per rule, so the feature belongs to every server
+// rather than to the one it was written for.
+model RoleRule {
+  id           String    @id @default(uuid())
+  guildId      String    @map("guild_id")
+  discordRoleId String   @map("discord_role_id")  // the role in Discord being granted
+  roleLabel    String    @map("role_label")       // its name when the rule was written, for the UI
+  enabled      Boolean   @default(false)
+  windowDays   Int       @default(30) @map("window_days")
+  minMessages  Int       @default(0) @map("min_messages")
+  minLinks     Int       @default(0) @map("min_links")   // links posted in the showcase channels
+  maxHolders   Int?      @map("max_holders")             // null = as many as qualify
+  lastRunAt    DateTime? @map("last_run_at")
+  createdBy    String    @map("created_by")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  holders RoleRuleHolder[]
+
+  @@unique([guildId, discordRoleId])   // one rule per role: two would fight over it
+  @@index([guildId])
+  @@map("role_rules")
+}
+
+// Who holds a role BECAUSE of a rule. The rule may only ever take back what it
+// gave: a member who already had the role, or was given it by hand, is invisible
+// to the sweep. Without this table the first run would strip the role from
+// everyone who has it.
+model RoleRuleHolder {
+  id        String   @id @default(uuid())
+  ruleId    String   @map("rule_id")
+  guildId   String   @map("guild_id")
+  discordId String   @map("discord_id")
+  grantedAt DateTime @default(now()) @map("granted_at")
+
+  rule RoleRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@unique([ruleId, discordId])
+  @@index([guildId])
+  @@map("role_rule_holders")
+}
+
+// ── Premium codes ────────────────────────────────────────────────────────────
+//
+// A code adds days to a server's plan. It does not change a price: the price of
+// a Discord subscription belongs to Discord and cannot carry a promotion, while
+// access here is decided by one row and every payment path writes it. So the
+// reward is time, which works the same for a server paying in crypto, through
+// Discord, or on a trial.
+model PremiumCode {
+  id        String           @id @default(uuid())
+  code      String           @unique
+  plan      SubscriptionPlan @default(PREMIUM)
+  days      Int
+  maxUses   Int              @default(1) @map("max_uses")
+  usedCount Int              @default(0) @map("used_count")
+  note      String?
+  expiresAt DateTime?        @map("expires_at")
+  disabled  Boolean          @default(false)
+  createdBy String           @map("created_by")
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  redemptions PremiumCodeRedemption[]
+
+  @@map("premium_codes")
+}
+
+model PremiumCodeRedemption {
+  id         String   @id @default(uuid())
+  codeId     String   @map("code_id")
+  guildId    String   @map("guild_id")
+  redeemedBy String   @map("redeemed_by")
+  days       Int
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  code PremiumCode @relation(fields: [codeId], references: [id], onDelete: Cascade)
+
+  @@unique([codeId, guildId])   // one server may use a given code once
+  @@index([guildId])
+  @@map("premium_code_redemptions")
+}
+
+// ── Uptime history ───────────────────────────────────────────────────────────
+//
+// One row per external probe. Written by the check that runs on GitHub rather
+// than on our own box, because a server cannot report that it is gone.
+//
+// The history lives in the database, which is a managed service on separate
+// infrastructure from the application — deliberately in the same city, for
+// latency, but not on the same machine. Losing the box loses no history, and the
+// page can say what happened once it is back.
+model UptimeProbe {
+  id        String   @id @default(uuid())
+  checkedAt DateTime @default(now()) @map("checked_at")
+  ok        Boolean
+  // Which endpoint failed and how, when it did. Null on a clean run.
+  detail    String?
+  // Round-trip to the API health endpoint, milliseconds, as seen from outside.
+  latencyMs Int?     @map("latency_ms")
+
+  @@index([checkedAt])
+  @@map("uptime_probes")
 }
