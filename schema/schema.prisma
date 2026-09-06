@@ -1685,6 +1685,10 @@ model PremiumCode {
   note      String?
   expiresAt DateTime?        @map("expires_at")
   disabled  Boolean          @default(false)
+  // When it was switched off. A disabled code keeps three days to be switched
+  // back on before the nightly sweep removes it — measured from here, because
+  // the only other timestamp on the row is when it was created.
+  disabledAt DateTime?       @map("disabled_at")
   createdBy String           @map("created_by")
   createdAt DateTime         @default(now()) @map("created_at")
 
@@ -1695,13 +1699,19 @@ model PremiumCode {
 
 model PremiumCodeRedemption {
   id         String   @id @default(uuid())
-  codeId     String   @map("code_id")
+  // Nullable, and SET NULL rather than CASCADE: codes get deleted now — by hand
+  // and by a nightly sweep — and the record of who used one must outlive it.
+  codeId     String?  @map("code_id")
+  // The code as typed, copied here at the moment of use. This is what survives
+  // the code being deleted, and what the subscriptions page reads to say which
+  // code gave a server its Premium.
+  codeText   String?  @map("code_text")
   guildId    String   @map("guild_id")
   redeemedBy String   @map("redeemed_by")
   days       Int
   createdAt  DateTime @default(now()) @map("created_at")
 
-  code PremiumCode @relation(fields: [codeId], references: [id], onDelete: Cascade)
+  code PremiumCode? @relation(fields: [codeId], references: [id], onDelete: SetNull)
 
   @@unique([codeId, guildId])   // one server may use a given code once
   @@index([guildId])
