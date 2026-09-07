@@ -520,6 +520,11 @@ model AuditLog {
   guildId     String          @map("guild_id")
   createdAt   DateTime        @default(now()) @map("created_at")
 
+  // The only question anything asks of this table: one guild, one time range.
+  // The logs page reads newest-first within the plan's retention window; the
+  // nightly sweep reads oldest-past-cutoff. Without it both were sequential
+  // scans with a filter.
+  @@index([guildId, createdAt(sort: Desc)])
   @@map("audit_logs")
 }
 
