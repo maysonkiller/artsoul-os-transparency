@@ -28,7 +28,7 @@ describe("the spam tracker never writes message text down", () => {
 
   it("persists no fragment of the message", async () => {
     p.protectionTracker.findUnique.mockResolvedValue(null);
-    await recordMessageWindow("100000000000000001", SECRET, 10_000);
+    await recordMessageWindow("G1", "100000000000000001", SECRET, 10_000);
 
     const written = JSON.stringify(p.protectionTracker.upsert.mock.calls[0][0]);
     expect(written).not.toContain(SECRET);
@@ -42,26 +42,50 @@ describe("the spam tracker never writes message text down", () => {
 
   it("still counts a repeat as a duplicate", async () => {
     p.protectionTracker.findUnique.mockResolvedValue(null);
-    const first = await recordMessageWindow("100000000000000001", "buy followers now", 10_000);
+    const first = await recordMessageWindow("G1", "100000000000000001", "buy followers now", 10_000);
     expect(first.dupCount).toBe(1);
 
     // Feed the first write back in as the stored row, the way the database would.
     const stored = p.protectionTracker.upsert.mock.calls[0][0].create;
     p.protectionTracker.findUnique.mockResolvedValue(stored);
 
-    const second = await recordMessageWindow("100000000000000001", "buy followers now", 10_000);
+    const second = await recordMessageWindow("G1", "100000000000000001", "buy followers now", 10_000);
     expect(second.dupCount).toBe(2);
     expect(second.count).toBe(2);
   });
 
   it("does not treat a different message as a duplicate", async () => {
     p.protectionTracker.findUnique.mockResolvedValue(null);
-    await recordMessageWindow("100000000000000001", "hello", 10_000);
+    await recordMessageWindow("G1", "100000000000000001", "hello", 10_000);
     const stored = p.protectionTracker.upsert.mock.calls[0][0].create;
     p.protectionTracker.findUnique.mockResolvedValue(stored);
 
-    const other = await recordMessageWindow("100000000000000001", "goodbye", 10_000);
+    const other = await recordMessageWindow("G1", "100000000000000001", "goodbye", 10_000);
     expect(other.dupCount).toBe(1);
     expect(other.count).toBe(2);
   });
+
+  it("cannot be looked up from a dictionary of common messages", async () => {
+    // Not storing the text is only half of it. A plain SHA-256 is deterministic
+    // everywhere and for ever, so anybody holding the database could hash the
+    // obvious messages — "gm", "hello", a known scam link — and read off who had
+    // sent them. The old comment claimed the value was "not stable across
+    // processes in any way that would let it be used as an identifier", which
+    // was simply untrue of SHA-256.
+    //
+    // Keyed with a server-side secret, the database alone is not enough.
+    const { createHash } = await import("crypto");
+    const text = "gm";
+    const bare = createHash("sha256").update(text).digest("hex").slice(0, 32);
+
+    p.protectionTracker.findUnique.mockResolvedValue(null);
+    await recordMessageWindow("G1", "100000000000000001", text, 10_000);
+
+    const written = JSON.stringify(p.protectionTracker.upsert.mock.calls[0][0]);
+    expect(written, "the fingerprint is just the hash of the message").not.toContain(bare);
+    // And it does still write a fingerprint, or the assertion above passes for
+    // the wrong reason.
+    expect(written).toMatch(/contentHashes/);
+  });
+
 });

@@ -175,6 +175,28 @@ function decodeInt(word: string): bigint {
   return BigInt(`0x${word}`);
 }
 
+// latestRoundData().answer is int256 — SIGNED — and reading it as unsigned turns
+// a negative price into a colossal positive one, which sails past `answer <= 0`
+// and prices an invoice at a fraction of a cent.
+//
+// An ETH/USD feed should never report a negative price, so this is not an
+// exploit anybody can reach today. It is money code reading a value in the wrong
+// encoding, and money code should fail closed on the impossible input rather
+// than rely on it staying impossible.
+const TWO_256 = 1n << 256n;
+const MAX_INT_256 = (1n << 255n) - 1n;
+
+function decodeSignedInt(word: string): bigint {
+  const raw = decodeInt(word);
+  return raw > MAX_INT_256 ? raw - TWO_256 : raw;
+}
+
+// A feed whose timestamp is in the future is broken or lying. Left unchecked it
+// is worse than a stale one: `now - updatedAt` goes negative, so the staleness
+// test passes for ever and the quote never expires. Small tolerance for ordinary
+// clock skew between us and the chain.
+const MAX_CLOCK_SKEW_SECONDS = 120;
+
 export async function fetchNativeQuote(rpcUrl: string, feed: string): Promise<Quote | null> {
   try {
     const [roundHex, decimalsHex] = await Promise.all([
@@ -184,12 +206,14 @@ export async function fetchNativeQuote(rpcUrl: string, feed: string): Promise<Qu
     const body = roundHex.replace(/^0x/, "");
     // latestRoundData() → (roundId, answer, startedAt, updatedAt, answeredInRound)
     if (body.length < 64 * 5) return null;
-    const answer = decodeInt(body.slice(64, 128));
+    const answer = decodeSignedInt(body.slice(64, 128));
     const updatedAt = Number(decodeInt(body.slice(192, 256)));
     const decimals = Number(decodeInt(decimalsHex.replace(/^0x/, "")));
     if (answer <= 0n || !Number.isFinite(decimals) || decimals < 0 || decimals > 36) return null;
     if (!Number.isFinite(updatedAt) || updatedAt <= 0) return null;
-    if (Date.now() / 1000 - updatedAt > MAX_QUOTE_AGE_SECONDS) return null;
+    const nowSeconds = Date.now() / 1000;
+    if (updatedAt - nowSeconds > MAX_CLOCK_SKEW_SECONDS) return null;
+    if (nowSeconds - updatedAt > MAX_QUOTE_AGE_SECONDS) return null;
 
     // Normalise whatever the feed's precision is onto a common 1e8 scale.
     const usdPerCoinE8 =
@@ -363,12 +387,17 @@ interface TransferScan {
   nativeFromOthers: bigint;
 }
 
+// `expectedFrom` is NOT nullable here on purpose. It used to be, with
+// `!expectedFrom ||` crediting any sender when it was missing — a permissive
+// branch guarded only by createIntent refusing to produce such a row. Requiring
+// the address in the signature makes that branch impossible rather than merely
+// unreached, so the compiler carries the rule instead of a convention.
 function scanTransfers(
   receipt: any,
   tx: any,
   token: string,
   payTo: string,
-  expectedFrom: string | null
+  expectedFrom: string
 ): TransferScan {
   const scan: TransferScan = {
     fromPayer: 0n, fromOthers: 0n, otherTokenToUs: false, nativeToUs: 0n, nativeFromOthers: 0n,
@@ -388,7 +417,7 @@ function scanTransfers(
       continue;
     }
     const sender = topicToAddress(log.topics[1]);
-    if (!expectedFrom || sender === expectedFrom) scan.fromPayer += value;
+    if (sender === expectedFrom) scan.fromPayer += value;
     else scan.fromOthers += value;
   }
 
@@ -399,7 +428,7 @@ function scanTransfers(
   try {
     if (tx && String(tx.to ?? "").toLowerCase() === payTo) {
       const from = String(tx.from ?? "").toLowerCase();
-      if (!expectedFrom || from === expectedFrom) scan.nativeToUs = BigInt(tx.value ?? "0x0");
+      if (from === expectedFrom) scan.nativeToUs = BigInt(tx.value ?? "0x0");
       else scan.nativeFromOthers = BigInt(tx.value ?? "0x0");
     }
   } catch {
@@ -413,11 +442,28 @@ function hasIntentTerms(intent: PaymentIntent): intent is PaymentIntent & {
   chainId: number;
   tokenDecimals: number;
   minConfirmations: number;
+  expectedFrom: string;
 } {
   return (
     intent.chainId !== null &&
     intent.tokenDecimals !== null &&
     intent.minConfirmations !== null &&
+    // A DECLARED PAYER IS PART OF THE TERMS, and this is the load-bearing one.
+    //
+    // scanTransfers credits any sender when expectedFrom is null. An invoice
+    // like that settles against any matching transfer to our address — so
+    // anybody could open an invoice, watch the chain for somebody else's
+    // payment to us, and submit that hash before its real owner did. The real
+    // payer would then be told their transaction was already used.
+    //
+    // createIntent refuses to make one: it requires an address matching
+    // ADDRESS_RE and says why. But the column is nullable, the verifier accepted
+    // null, and one function was the whole defence — so a second creation path,
+    // a backfill, or a hand-written row would silently reopen it. The check
+    // belongs here, where the money is actually released.
+    //
+    // Checked live on 6 September: 4 intents, none without a payer.
+    !!intent.expectedFrom &&
     // A token invoice is meaningless without the contract it is written against;
     // a native one is defined by the absence of a contract.
     (intent.payCurrency === "NATIVE" ? !intent.tokenAddress : !!intent.tokenAddress)
@@ -498,7 +544,8 @@ export async function verifyPayment(intentId: string, submittedHash: string): Pr
   // Count ONLY what the declared payer sent. Crediting every transfer in the
   // transaction would let an invoice be settled by funds someone else moved in
   // the same block of calls, and would still accept a hash lifted off the chain.
-  const expectedFrom = intent.expectedFrom?.toLowerCase() ?? null;
+  // Non-null past hasIntentTerms, which now refuses an invoice without a payer.
+  const expectedFrom = intent.expectedFrom.toLowerCase();
 
   const scan = scanTransfers(receipt, tx, token, payTo, expectedFrom);
   // Which side of the scan settles this invoice is decided by what it was
@@ -527,10 +574,38 @@ export async function verifyPayment(intentId: string, submittedHash: string): Pr
     return { ok: false, reason: "no_matching_transfer" };
   }
 
-  const fromAddress = expectedFrom ?? null;
+  const fromAddress = expectedFrom;
 
   try {
     return await prisma.$transaction(async (db) => {
+      // ── Take the invoice before touching it ──────────────────────────────
+      //
+      // Two real payments verified at the same moment used to end badly for the
+      // second one. Both banked their transfer, the first claimed the invoice
+      // and extended the subscription, and the second found the invoice already
+      // CONFIRMED and returned success — WITHOUT extending anything. Its
+      // transfer was now recorded against this invoice, and because txHash is
+      // globally unique in that table it could never be applied to another one.
+      // The customer had paid twice and had one period to show for it, with the
+      // second payment unusable.
+      //
+      // Reachable without anybody behaving strangely: the background scanner can
+      // verify a transfer at the same moment the customer submits one, and
+      // partial payments mean sending two transfers is a supported thing to do.
+      //
+      // Read Committed does not serialize these on its own — the second
+      // transaction can still read the invoice as PENDING from its snapshot — so
+      // the row is locked. Everything below then sees a settled state.
+      await db.$executeRaw`SELECT id FROM payment_intents WHERE id = ${intentId} FOR UPDATE`;
+
+      // Re-read under the lock. If it was confirmed while we waited, and by a
+      // DIFFERENT transfer, this one must not be consumed: refusing without
+      // banking leaves it free to pay another invoice, which is the whole point.
+      const settled = await db.paymentIntent.findUnique({ where: { id: intentId } });
+      if (settled?.status === "CONFIRMED" && settled.txHash?.toLowerCase() !== txHash) {
+        return { ok: false, reason: "intent_already_paid" };
+      }
+
       // Replay protection spans both the legacy single-hash column and the
       // per-transfer table, so a hash counts exactly once wherever it is offered.
       const usedByIntent = await db.paymentIntent.findUnique({ where: { txHash } });
