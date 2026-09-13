@@ -738,7 +738,11 @@ model ProtectionTracker {
 // dashboard instead of code. One row per panel, keyed by panelKey.
 model PanelConfig {
   id          String   @id @default(uuid())
-  panelKey    String   @unique @map("panel_key") // "welcome" | "regions" | "admin" | ...
+  // Panels belong to a guild. `panelKey` was unique on its own until 13 Sep
+  // 2026, which meant one welcome panel and one region list for every customer
+  // on the box — and it is why /region could not be offered off our own server.
+  guildId     String   @map("guild_id")
+  panelKey    String   @map("panel_key")         // "welcome" | "regions" | "admin" | ...
   enabled     Boolean  @default(true)
   title       String
   description String
@@ -755,6 +759,8 @@ model PanelConfig {
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 
+  @@unique([guildId, panelKey])
+  @@index([guildId])
   @@map("panel_configs")
 }
 
