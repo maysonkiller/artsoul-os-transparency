@@ -1,0 +1,235 @@
+--- schema/schema.prisma
++++ schema/schema.prisma
+@@ -104,6 +104,7 @@
+   SUSPICIOUS_SHORTENER
+   SUSPICIOUS_ACCOUNT
+   RAID_SPIKE
++  SUSPICIOUS_LINK // scored as risky by the link engine, not on any list
+ }
+ 
+ enum Severity {
+@@ -135,6 +136,10 @@
+   TEAM
+   SYSTEM
+   BOT
++  // Someone who manages a customer's server. TEAM means our own team on our own
++  // server; filing a customer's moderator under it was a lie in the audit log,
++  // and SYSTEM (what manual warnings used to be filed under) was a worse one.
++  MANAGER
+ }
+ 
+ enum AuditTargetType {
+@@ -305,6 +310,17 @@
+   // in the guild. Set by the leave/kick/ban path, cleared on (re)join. The member
+   // list filters on this so departed members never linger as "active".
+   leftAt              DateTime? @map("left_at")
++  // How the member appears on THIS server, as Discord last reported it (member
++  // sync, 18 September 2026). Until then only a username was stored, so avatars
++  // and nicknames were fetched from our own server for every server's members,
++  // and went stale the moment anyone changed them.
++  nickname            String?   @map("nickname")
++  globalName          String?   @map("global_name")
++  avatarHash          String?   @map("avatar_hash")
++  guildAvatarHash     String?   @map("guild_avatar_hash")
++  joinedAt            DateTime? @map("joined_at")
++  discordRoleIds      String[]  @default([]) @map("discord_role_ids")
++  profileSyncedAt     DateTime? @map("profile_synced_at")
+   createdAt           DateTime  @default(now()) @map("created_at")
+   updatedAt           DateTime  @updatedAt @map("updated_at")
+ 
+@@ -1750,3 +1766,195 @@
+   @@index([checkedAt])
+   @@map("uptime_probes")
+ }
++
++// ── Moderation cases ─────────────────────────────────────────────────────────
++//
++// The canonical record of a moderation action, one row per action, numbered per
++// guild so a member and a moderator can both say "case #42". Added 18 September
++// 2026. Before it, a manual warning wrote a `warnings` row and an audit line and
++// nothing else: the member was never told, nothing appeared under Protection →
++// Events, and the audit line was filed as SYSTEM under the home guild whatever
++// server it happened on.
++//
++// `warnings` and `timeouts` stay as they are — escalation, expiry and the risk
++// score read them — and a case points at the row it produced. Audit logs remain
++// the immutable administrative history; this table is the moderation history a
++// staff member looks up, and it is what Protection → Events shows for manual
++// actions.
++enum ModerationCaseAction {
++  WARN
++  TIMEOUT
++  UNTIMEOUT
++  KICK
++  BAN
++}
++
++enum ModerationCaseStatus {
++  ACTIVE
++  REVOKED
++}
++
++// Whether the member was told. Kept apart from the case itself because a member
++// with DMs closed has still been warned: the case succeeded, the delivery did not.
++enum ModerationNotifyStatus {
++  NOT_ATTEMPTED
++  DELIVERED
++  FAILED
++}
++
++model ModerationCase {
++  id               String                 @id @default(uuid())
++  guildId          String                 @map("guild_id")
++  caseNumber       Int                    @map("case_number")
++  action           ModerationCaseAction
++  status           ModerationCaseStatus   @default(ACTIVE)
++  targetDiscordId  String                 @map("target_discord_id")
++  // Snapshots, so history still reads correctly after a rename or departure.
++  targetUsername   String?                @map("target_username")
++  actorDiscordId   String                 @map("actor_discord_id") // "SYSTEM" only for automatic actions
++  actorType        AuditActorType         @map("actor_type")
++  actorUsername    String?                @map("actor_username")
++  reason           String
++  source           TimeoutSource
++  expiresAt        DateTime?              @map("expires_at")
++  warningId        String?                @unique @map("warning_id")
++  timeoutId        String?                @unique @map("timeout_id")
++  notifyStatus     ModerationNotifyStatus @default(NOT_ATTEMPTED) @map("notify_status")
++  notifyMethod     String?                @map("notify_method")
++  notifyError      String?                @map("notify_error")
++  notifiedAt       DateTime?              @map("notified_at")
++  // One submission, one case: a double click or a retried request carries the
++  // same key and gets the existing case back instead of a second warning.
++  idempotencyKey   String?                @map("idempotency_key")
++  revokedAt        DateTime?              @map("revoked_at")
++  revokedBy        String?                @map("revoked_by")
++  revokeReason     String?                @map("revoke_reason")
++  // Append-only moderator notes: [{ by, at, text }].
++  notes            Json?
++  createdAt        DateTime               @default(now()) @map("created_at")
++  updatedAt        DateTime               @updatedAt @map("updated_at")
++
++  @@unique([guildId, caseNumber])
++  @@unique([guildId, idempotencyKey])
++  @@index([guildId, createdAt(sort: Desc)])
++  @@index([guildId, targetDiscordId])
++  @@map("moderation_cases")
++}
++
++// Per-guild case numbering. Incremented with a single
++// INSERT … ON CONFLICT … RETURNING, so two moderators acting at once can never
++// draw the same number.
++model ModerationCaseCounter {
++  guildId    String @id @map("guild_id")
++  lastNumber Int    @default(0) @map("last_number")
++
++  @@map("moderation_case_counters")
++}
++
++// ── PROTECTION 2.0 (18 September 2026) ───────────────────────────────────────
++//
++// Protection used to run only on our own server, against one global blacklist
++// that only our team could edit, while the permission list sold to every server
++// ("Manage Messages: remove spam and blacklisted links") described it working
++// everywhere. These tables make it a per-server module.
++
++// The per-server switch. Our own server is on unless switched off; any other
++// server is off until its manager switches it on.
++model ProtectionSettings {
++  guildId   String   @id @map("guild_id")
++  enabled   Boolean  @default(false)
++  updatedBy String?  @map("updated_by")
++  updatedAt DateTime @updatedAt @map("updated_at")
++
++  @@map("protection_settings")
++}
++
++enum DomainRuleKind {
++  BLOCK
++  TRUST
++}
++
++enum DomainRuleSource {
++  MANUAL
++  LEGACY // copied from blacklisted_domains
++  THREAT_INTEL
++  SUGGESTION // approved from the review queue
++}
++
++// A domain a server has blocked or trusted. guildId null = applies to every
++// server (only our operator manages those). A domain and its subdomains match.
++// Uniqueness per (server, domain, kind) is enforced by two partial indexes in the
++// migration, because a unique index treats NULL guilds as all different.
++model DomainRule {
++  id          String           @id @default(uuid())
++  guildId     String?          @map("guild_id")
++  domain      String
++  kind        DomainRuleKind
++  source      DomainRuleSource @default(MANUAL)
++  confidence  Int              @default(100)
++  reason      String
++  addedBy     String           @map("added_by")
++  addedByName String?          @map("added_by_name")
++  expiresAt   DateTime?        @map("expires_at")
++  createdAt   DateTime         @default(now()) @map("created_at")
++  updatedAt   DateTime         @updatedAt @map("updated_at")
++
++  @@index([guildId])
++  @@index([domain])
++  @@map("domain_rules")
++}
++
++enum DomainSuggestionStatus {
++  PENDING
++  APPROVED
++  REJECTED
++}
++
++// Domains worth a person's decision: unknown domains staff post (never trusted
++// automatically) and risky ones nobody has listed yet. Nothing here takes effect
++// until someone approves it. Holds counts and reason codes, never message text.
++model DomainSuggestion {
++  id           String                 @id @default(uuid())
++  guildId      String                 @map("guild_id")
++  domain       String
++  kind         DomainRuleKind
++  status       DomainSuggestionStatus @default(PENDING)
++  reason       String
++  seenCount    Int                    @default(1) @map("seen_count")
++  lastRisk     Int?                   @map("last_risk")
++  evidence     Json?
++  firstSeenAt  DateTime               @default(now()) @map("first_seen_at")
++  lastSeenAt   DateTime               @default(now()) @map("last_seen_at")
++  decidedBy    String?                @map("decided_by")
++  decidedAt    DateTime?              @map("decided_at")
++  decisionNote String?                @map("decision_note")
++
++  @@unique([guildId, domain, kind])
++  @@index([guildId, status])
++  @@map("domain_suggestions")
++}
++
++// ── MEMBER SYNC (18 September 2026) ──────────────────────────────────────────
++//
++// One row per server: when its member list was last reconciled with Discord in
++// full, how that went, and when the last live event arrived. RUNNING doubles as
++// the lock that keeps two full syncs of one server from overlapping.
++enum MemberSyncStatus {
++  IDLE
++  RUNNING
++  FAILED
++}
++
++model MemberSyncState {
++  guildId        String           @id @map("guild_id")
++  status         MemberSyncStatus @default(IDLE)
++  lastStartedAt  DateTime?        @map("last_started_at")
++  lastFinishedAt DateTime?        @map("last_finished_at")
++  lastSuccessAt  DateTime?        @map("last_success_at")
++  lastError      String?          @map("last_error")
++  lastResult     Json?            @map("last_result")
++  lastEventAt    DateTime?        @map("last_event_at")
++  updatedAt      DateTime         @updatedAt @map("updated_at")
++
++  @@map("member_sync_state")
++}
