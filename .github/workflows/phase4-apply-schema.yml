@@ -1,0 +1,36 @@
+name: Phase 4 exact schema apply
+
+on:
+  push:
+    branches: [chatgpt/phase4-schema-sync]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: chatgpt/phase4-schema-sync
+      - name: Apply patch and require exact private-schema blob
+        shell: bash
+        run: |
+          before="$(git hash-object schema/schema.prisma)"
+          echo "before=$before"
+          test "$before" = "ba4a8fde707b875ca4069a448e44e1b95fc336cf" || { echo "Unexpected public schema base; refusing to patch"; exit 1; }
+          patch --batch --forward -p0 < .phase4-schema.patch
+          after="$(git hash-object schema/schema.prisma)"
+          echo "after=$after"
+          test "$after" = "9d095298053fd6fed4dab5ecaa15c2e3664c3007" || { echo "Target schema SHA mismatch; refusing to commit"; exit 1; }
+      - name: Commit only verified schema and remove temporary machinery
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add schema/schema.prisma
+          git rm .phase4-schema.patch .github/workflows/phase4-apply-schema.yml
+          git commit -m "Publish current ArtSoul OS schema"
+          git push origin HEAD:chatgpt/phase4-schema-sync
