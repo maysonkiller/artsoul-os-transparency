@@ -435,7 +435,20 @@ model GithubVerification {
   accountAgeDays          Int                @map("account_age_days")
   hasAvatar               Boolean            @map("has_avatar")
   hasPublicProfile        Boolean            @map("has_public_profile")
+  // True only when a follow check actually ran and passed. Rows written before
+  // UX03 stored the star result here; they are not treated as follow proof.
   followsRequiredAccount  Boolean            @map("follows_required_account")
+  // The policy this proof was made under (fingerprint of the requirements) and
+  // each check's outcome (PASSED / FAILED / NOT_REQUIRED / UNAVAILABLE). A claim
+  // needs the fingerprint of the policy in force at claim time.
+  policyFingerprint       String?            @map("policy_fingerprint")
+  checkResults            Json?              @map("check_results")
+  // Set when this proof was used to claim the role: which Discord role, and
+  // whether the bot added it (ADDED), found it already there (ALREADY_HELD) or
+  // could not (FAILED). Only a role the module added is ever removed by it.
+  claimedAt               DateTime?          @map("claimed_at")
+  discordRoleId           String?            @map("discord_role_id")
+  discordSync             String?            @map("discord_sync")
   status                  VerificationStatus
   checkedAt               DateTime           @default(now()) @map("checked_at")
   nextRecheckAt           DateTime?          @map("next_recheck_at")
@@ -719,6 +732,9 @@ model OAuthState {
   // in this row. Default = home guild as insurance for rows created mid-deploy;
   // /verify/github/start always writes it explicitly.
   guildId   String @map("guild_id")
+  // The policy the member was shown when they started. If the server changes
+  // its requirements before GitHub calls back, the callback refuses.
+  policyFingerprint String? @map("policy_fingerprint")
   createdAt DateTime @default(now()) @map("created_at")
   expiresAt DateTime @map("expires_at")
 
@@ -944,6 +960,11 @@ model GreetingSignal {
   guildId             String   @id @map("guild_id")
   enabled             Boolean  @default(false) // OFF by default per guild
   triggerText         String   @default("gm") @map("trigger_text")
+  // Other words that count exactly like triggerText: same reaction, cooldown
+  // and XP. triggerText stays the primary, the one a new channel is named after
+  // and the bot quotes. At most nine, trimmed and de-duplicated on save
+  // (packages/shared/src/greeting.ts), so the hot path only ever compares.
+  triggerAliases      String[] @default([]) @map("trigger_aliases")
   caseInsensitive     Boolean  @default(true) @map("case_insensitive")
   channelId           String?  @map("channel_id") // the greeting channel (null = not configured)
   strictMode          Boolean  @default(false) @map("strict_mode") // only the trigger word is allowed
@@ -1503,12 +1524,31 @@ model GenesisSettings {
 // per guild. A new client sees the feature but the repo/owner fields are empty
 // ("requires configuration"). The home guild is seeded enabled with the operator's
 // repo (sourced from env, never a hardcoded literal).
+// One GitHub verification policy per guild (UX03). Every check is chosen by the
+// guild's administrator; a new row asks for nothing beyond connecting GitHub.
+// Rows that existed before UX03 were migrated to keep exactly the checks they
+// always ran (star when a repo was set, profile, public repo, Verify Access
+// first, revoke at recheck). The old avatar check passed every account and is
+// gone; see packages/shared/src/githubPolicy.ts. The reward role is the guild's BUILDER entry
+// in guild_role_map, not a column here, so there is one binding.
 model GithubBuilderSettings {
   guildId       String   @id @map("guild_id")
   enabled       Boolean  @default(false) // OFF by default per guild
-  requiredRepo  String?  @map("required_repo")  // "owner/repo" the user must star
-  ownerUsername String?  @map("owner_username") // account the user must follow
-  minAccountAgeDays Int  @default(180) @map("min_account_age_days")
+  requireStar   Boolean  @default(false) @map("require_star")
+  requiredRepo  String?  @map("required_repo")  // "owner/repo" to star, when requireStar
+  requireFollow Boolean  @default(false) @map("require_follow")
+  followUsername String? @map("follow_username") // GitHub USER to follow, when requireFollow
+  // Excused from the star check only. The column kept its old name; it was
+  // never a follow target, whatever the name suggested.
+  exemptUsername String? @map("owner_username")
+  minAccountAgeDays Int  @default(180) @map("min_account_age_days") // 0 = no minimum
+  requirePublicProfile Boolean @default(false) @map("require_public_profile")
+  requirePublicRepo    Boolean @default(false) @map("require_public_repo")
+  requireVerifyAccess  Boolean @default(false) @map("require_verify_access") // active GUEST first
+  revokeOnRecheck      Boolean @default(false) @map("revoke_on_recheck")
+  // With revokeOnRecheck: only a missing star revokes (the pre-UX03 rule, kept
+  // for rows that existed before); other failures are flagged for review.
+  revokeStarOnly       Boolean @default(false) @map("revoke_star_only")
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
 
