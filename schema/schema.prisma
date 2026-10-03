@@ -1998,3 +1998,90 @@ model MemberSyncState {
 
   @@map("member_sync_state")
 }
+
+// ── Adoption drafts (B02.2) ──────────────────────────────────────────────────
+//
+// A saved, reviewable plan for adopting a server's existing roles and
+// channels. Drafts only: nothing here is a live binding. guild_role_map,
+// guild_channel_map and every module setting stay exactly as they were until
+// a later checkpoint applies an approved plan.
+//
+// One open draft per server: active_guild_id holds the guild id while the run
+// is a DRAFT and is cleared when it is cancelled or expires, so the unique
+// index admits one open run and any number of closed ones.
+
+enum AdoptionRunState {
+  DRAFT
+  CANCELLED
+  EXPIRED
+  APPLIED // reviewed mappings saved; see AdoptionApplication
+}
+
+model AdoptionRun {
+  id                  String           @id @default(uuid())
+  guildId             String           @map("guild_id")
+  activeGuildId       String?          @unique @map("active_guild_id")
+  createdBy           String           @map("created_by") // Discord id of the manager who started it
+  profiles            Json // selected adoption modules, validated server-side
+  state               AdoptionRunState @default(DRAFT)
+  revision            Int              @default(1) // bumped by every saved change; editors send the one they loaded
+  observedAt          DateTime         @map("observed_at") // when the server and settings were last read for this run
+  expiresAt           DateTime         @map("expires_at")
+  snapshotFingerprint String?          @map("snapshot_fingerprint") // structural (B01.1), excludes names
+  inputFingerprint    String           @map("input_fingerprint") // everything the proposer reads, names included
+  mappingsFingerprint String           @map("mappings_fingerprint")
+  plan                Json? // the last server-computed plan (never client-supplied)
+  planKind            String?          @map("plan_kind") // SCAN | PREVIEW | STALE
+  planRevision        Int?             @map("plan_revision") // the revision the plan was computed for
+  plannedAt           DateTime?        @map("planned_at")
+  endedAt             DateTime?        @map("ended_at")
+  createdAt           DateTime         @default(now()) @map("created_at")
+  updatedAt           DateTime         @updatedAt @map("updated_at")
+  items               AdoptionItem[]
+  application         AdoptionApplication?
+
+  @@index([guildId, createdAt(sort: Desc)])
+  @@map("adoption_runs")
+}
+
+model AdoptionItem {
+  id             String      @id @default(uuid())
+  runId          String      @map("run_id")
+  run            AdoptionRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  slotKey        String      @map("slot_key") // e.g. ROLE:BUILDER, as the planner names slots
+  required       Boolean
+  decision       Json? // the admin's explicit decision; null = follow the proposal
+  decidedAgainst String?     @map("decided_against") // the run's input fingerprint when decided
+  decidedBy      String?     @map("decided_by")
+  decidedAt      DateTime?   @map("decided_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+
+  @@unique([runId, slotKey])
+  @@map("adoption_items")
+}
+
+// One applied adoption run: which reviewed mappings were saved, by whom, from
+// which preview, and each row exactly as it was before and after. The receipt
+// is the record a later guarded undo works from; it holds ids and logical keys
+// only, never tokens, member lists, snapshots or message content. At most one
+// per run, and a request key names one request per server, so a retried apply
+// returns this row instead of writing again.
+model AdoptionApplication {
+  id               String      @id @default(uuid()) // the operation id
+  runId            String      @unique @map("run_id")
+  run              AdoptionRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  guildId          String      @map("guild_id")
+  requestKey       String      @map("request_key")
+  requestHash      String      @map("request_hash") // the revision, preview and selection the key was used for
+  appliedBy        String      @map("applied_by") // Discord id of the administrator
+  revision         Int
+  previewedAt      DateTime    @map("previewed_at") // the plannedAt of the preview that was confirmed
+  inputFingerprint String      @map("input_fingerprint")
+  result           String // APPLIED_MAPPINGS
+  receipt          Json
+  committedAt      DateTime    @map("committed_at")
+
+  @@unique([guildId, requestKey])
+  @@index([guildId, committedAt(sort: Desc)])
+  @@map("adoption_applications")
+}
