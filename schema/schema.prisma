@@ -2080,8 +2080,47 @@ model AdoptionApplication {
   result           String // APPLIED_MAPPINGS
   receipt          Json
   committedAt      DateTime    @map("committed_at")
+  recoveries       AdoptionRecovery[]
 
   @@unique([guildId, requestKey])
   @@index([guildId, committedAt(sort: Desc)])
   @@map("adoption_applications")
+}
+
+// One guarded undo of an applied adoption (B02.3B): which of the applied rows
+// were put back, by whom, and each one exactly as it went from and to. Undo
+// writes a row only while it still holds the value Apply wrote, so an edit
+// made since is never overwritten. Ids and logical keys only, as the Apply
+// receipt. A request key names one request per server.
+model AdoptionRecovery {
+  id            String                  @id @default(uuid()) // the recovery id
+  applicationId String                  @map("application_id")
+  application   AdoptionApplication     @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  runId         String                  @map("run_id")
+  guildId       String                  @map("guild_id")
+  requestKey    String                  @map("request_key")
+  requestHash   String                  @map("request_hash") // the operation and selection the key was used for
+  undoneBy      String                  @map("undone_by") // Discord id of the administrator
+  result        String // RESTORED_MAPPINGS
+  receipt       Json
+  committedAt   DateTime                @map("committed_at")
+  items         AdoptionRecoveredItem[]
+
+  @@unique([guildId, requestKey])
+  @@index([applicationId])
+  @@map("adoption_recoveries")
+}
+
+// Each applied item undone, once: unique on the application and the item, so
+// two undos of one item, at once or later, cannot both write.
+model AdoptionRecoveredItem {
+  id            String           @id @default(uuid())
+  recoveryId    String           @map("recovery_id")
+  recovery      AdoptionRecovery @relation(fields: [recoveryId], references: [id], onDelete: Cascade)
+  applicationId String           @map("application_id")
+  itemKey       String           @map("item_key")
+
+  @@unique([applicationId, itemKey])
+  @@index([recoveryId])
+  @@map("adoption_recovered_items")
 }
