@@ -37,14 +37,16 @@ through a Chainlink feed. Every value it compares comes from the chain.
 against the invoice rather than being rejected. **"A transaction cannot be
 reused."** Each hash is recorded once and refused thereafter.
 
-**"Message content is never stored."** This was wrong until recently, and the
-honest version is worth stating precisely, including the limits of what is
-proven here.
+**"The content of Discord messages is never stored."** This was wrong until
+recently, and the honest version is worth stating precisely, including the
+limits of what is proven here.
 
 *The claim:* ArtSoul OS does not persist the body of a Discord message.
 
-*The evidence in this repository:* the complete schema, which has no column that
-could hold one; `protection.tracker.ts`, the one component that has ever received
+*The evidence in this repository:* the complete schema, which has no column made
+to hold one (the one table that stores message text, `support_messages`, holds
+what people write to us on the support page and our answers, not Discord
+messages); `protection.tracker.ts`, the one component that has ever received Discord
 message text, which now keeps a truncated one-way hash rather than the text; and
 `protection-tracker-privacy.test.ts`, which feeds it a message full of
 recognisable secrets and asserts that no fragment survives into what is written.
@@ -53,11 +55,18 @@ The column rename from `contents` to `content_hashes` is visible in the schema.
 *What this cannot prove:* the rest of the bot is closed, so these files
 demonstrate the claim rather than establishing it for every line we have not
 published. The schema is the strongest part of the argument, because a value has
-to be stored somewhere and there is nowhere for it to go.
+to be stored somewhere and there is nowhere made for it to go. The exception is visible:
+`support_messages.body` keeps the text of support requests, written to us on
+purpose, and of our answers, so that a conversation can continue. The schema
+shows that the column exists, not what fills it; that it is filled only by the
+support page and our own answers is something the closed code does, and the
+tests published here do not cover it.
 
 **"We store the minimum."** The schema is complete and unedited. There is no
-column anywhere that holds the body of a message. XP counts that a message
-happened; `MemberXp` holds a number and a timestamp.
+column that holds the body of a Discord message. The one table that stores
+message text is `support_messages`: what somebody writes to us on the support
+page and our answers, kept so that the conversation can continue. XP counts
+that a message happened; `MemberXp` holds a number and a timestamp.
 
 ## What is not here
 

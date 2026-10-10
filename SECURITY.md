@@ -24,8 +24,8 @@ programme that quietly never pays out.
 - Anything that lets a payment be counted twice, counted without being made, or
   attributed to the wrong server.
 - Anything that escalates a member above the access level they were granted.
-- Anything that exposes message content, which the product states it does not
-  store.
+- Anything that exposes the content of Discord messages, which the product
+  states it does not store, or a support request to anybody but the operator.
 
 ## Out of scope
 
