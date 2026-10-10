@@ -2124,3 +2124,103 @@ model AdoptionRecoveredItem {
   @@index([recoveryId])
   @@map("adoption_recovered_items")
 }
+
+// ── Support threads (B04.2, 6 October 2026) ──────────────────────────────────
+//
+// Somebody writes from the public /support page; the system owner reads and
+// answers in the Founder Inbox. The thread here is the conversation. Email only
+// tells people that something was written: no mailbox is read, and a reply sent
+// to an email does not come back into a thread.
+//
+// Not per server, on purpose. A request is written to the people who run the
+// product, not to any server's staff, so no guild_id: nothing a server's
+// managers can read reaches these rows, and none of it is copied into
+// audit_logs, which every server's staff read. Plain text only; no attachment
+// and no HTML is stored.
+
+enum SupportCategory {
+  SUPPORT
+  PARTNERSHIP
+  BILLING
+  BUG
+  OTHER
+}
+
+// Who is expected to write next. CLOSED is the owner's decision.
+enum SupportThreadStatus {
+  WAITING_ON_FOUNDER
+  WAITING_ON_REQUESTER
+  CLOSED
+}
+
+enum SupportAuthor {
+  REQUESTER
+  FOUNDER
+}
+
+// Whether a founder reply reached the mail provider. Kept apart from the
+// message itself: the reply is in the thread whether or not the email went.
+enum SupportDeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model SupportThread {
+  id                 String              @id @default(uuid())
+  category           SupportCategory
+  status             SupportThreadStatus @default(WAITING_ON_FOUNDER)
+  subject            String
+  // Where answers are emailed. Fixed when the request is sent; the requester
+  // cannot move an existing thread to another address.
+  requesterEmail     String              @map("requester_email")
+  // Set only when the requester was signed in: the only key that lets anybody
+  // read the thread back on the web. Never taken from the request body.
+  requesterDiscordId String?             @map("requester_discord_id")
+  requesterName      String?             @map("requester_name") // the session's Discord name
+  language           String              @default("en") // en | ru, for the mail sent to the requester
+  // The browser's key for the press of Send that created this, so a retried
+  // request finds the thread instead of opening a second one.
+  createKey          String?             @unique @map("create_key")
+  // A requester message the owner has not read yet. Set by every requester
+  // message; cleared only through the newest requester message the owner was
+  // shown, so a reply that arrives while the owner reads stays unread.
+  founderUnread      Boolean             @default(true) @map("founder_unread")
+  founderReadAt      DateTime?           @map("founder_read_at")
+  lastRequesterAt    DateTime            @map("last_requester_at")
+  lastFounderAt      DateTime?           @map("last_founder_at")
+  lastMessageAt      DateTime            @map("last_message_at")
+  closedAt           DateTime?           @map("closed_at")
+  createdAt          DateTime            @default(now()) @map("created_at")
+  updatedAt          DateTime            @updatedAt @map("updated_at")
+  messages           SupportMessage[]
+
+  @@index([requesterDiscordId, lastMessageAt(sort: Desc)])
+  @@index([status, lastMessageAt(sort: Desc)])
+  @@index([lastMessageAt(sort: Desc)])
+  @@index([founderUnread])
+  @@map("support_threads")
+}
+
+model SupportMessage {
+  id               String                 @id @default(uuid())
+  threadId         String                 @map("thread_id")
+  thread           SupportThread          @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  authorType       SupportAuthor          @map("author_type")
+  authorDiscordId  String?                @map("author_discord_id") // null for a requester who was not signed in
+  body             String // plain text, as written
+  // One press of Send, one message: the same key in the same thread returns the
+  // message already saved, and sends nothing a second time.
+  requestKey       String?                @map("request_key")
+  // Founder replies only: the email to the requester. Null on requester messages.
+  deliveryStatus   SupportDeliveryStatus? @map("delivery_status")
+  deliveryError    String?                @map("delivery_error") // a code, never the provider's text
+  deliveryAttempts Int                    @default(0) @map("delivery_attempts")
+  lastAttemptAt    DateTime?              @map("last_attempt_at")
+  deliveredAt      DateTime?              @map("delivered_at")
+  createdAt        DateTime               @default(now()) @map("created_at")
+
+  @@unique([threadId, requestKey])
+  @@index([threadId, createdAt])
+  @@map("support_messages")
+}
